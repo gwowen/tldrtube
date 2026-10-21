@@ -5,10 +5,11 @@ import re
 import httpx
 import pytest
 from langchain_core.exceptions import OutputParserException
+from ollama import ResponseError
 
 from tldrtube.cli import configure_logging
 from tldrtube.models import MAX_EVIDENCE_IDS, PRESETS, Claim, ExtractResponse, SummaryResponse
-from tldrtube.summarizer import ModelError, resolve_base_url, summarize
+from tldrtube.summarizer import ModelError, require_installed_model, resolve_base_url, summarize
 from tldrtube.transcript import build_transcript
 from tldrtube.verifier import VerificationError
 
@@ -350,12 +351,108 @@ def test_parse_failure_retries_once_then_fails() -> None:
     assert len(chat.calls) == 2
 
 
+class _TagsResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def tags_response(models: list[dict]):
+    def get(*args, **kwargs):
+        assert str(args[0]).endswith("/api/tags")
+        return _TagsResponse({"models": models})
+
+    return get
+
+
 def test_connection_errors_are_not_retried(monkeypatch) -> None:
     monkeypatch.delenv("OLLAMA_HOST", raising=False)
     source = transcript_with("The lecture shows how a hash table stores keys.")
     chat = FakeChat([httpx.ConnectError("refused")])
-    with pytest.raises(ModelError, match="ollama pull"):
+    with pytest.raises(ModelError, match="Start Ollama") as exc:
         summarize(source, preset=PRESETS["short"], chat_model=chat, base_url="http://127.0.0.1:11434")
+    assert "ollama pull" not in str(exc.value)
+    assert len(chat.calls) == 1
+
+
+def test_missing_model_lists_installed_names(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tldrtube.summarizer.httpx.get",
+        tags_response([{"name": "gemma3:4b"}, {"model": "llama3.2:latest"}]),
+    )
+    with pytest.raises(ModelError) as exc:
+        require_installed_model("missing-model", "http://127.0.0.1:11434")
+    message = str(exc.value)
+    assert "gemma3:4b" in message
+    assert "llama3.2:latest" in message
+    assert "tldrtube_config.toml" in message
+    assert "--model" in message
+    assert "ollama pull missing-model" in message
+
+
+def test_no_installed_models_suggests_a_download(monkeypatch) -> None:
+    monkeypatch.setattr("tldrtube.summarizer.httpx.get", tags_response([]))
+    with pytest.raises(ModelError) as exc:
+        require_installed_model("missing-model", "http://127.0.0.1:11434")
+    message = str(exc.value)
+    assert "no installed models" in message
+    assert "ollama pull missing-model" in message
+
+
+def test_tagless_name_matches_an_installed_tag(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tldrtube.summarizer.httpx.get",
+        tags_response([{"name": "llama3:latest"}]),
+    )
+    require_installed_model("llama3", "http://127.0.0.1:11434")
+    require_installed_model("llama3:latest", "http://127.0.0.1:11434")
+    with pytest.raises(ModelError, match="llama3:latest"):
+        require_installed_model("llama", "http://127.0.0.1:11434")
+
+
+def test_unreachable_ollama_does_not_suggest_a_pull(monkeypatch) -> None:
+    def get(*args, **kwargs):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr("tldrtube.summarizer.httpx.get", get)
+    with pytest.raises(ModelError, match="Start Ollama") as exc:
+        require_installed_model("missing-model", "http://127.0.0.1:11434")
+    assert "ollama pull" not in str(exc.value)
+
+
+def test_missing_model_during_generation_lists_installed_models(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tldrtube.summarizer.httpx.get",
+        tags_response([{"name": "gemma3:4b"}]),
+    )
+    source = transcript_with("The lecture shows how a hash table stores keys.")
+    chat = FakeChat([ResponseError("model 'missing-model' not found", 404)])
+    with pytest.raises(ModelError) as exc:
+        summarize(
+            source,
+            preset=PRESETS["short"],
+            chat_model=chat,
+            model="missing-model",
+            base_url="http://127.0.0.1:11434",
+        )
+    message = str(exc.value)
+    assert "gemma3:4b" in message
+    assert "tldrtube_config.toml" in message
+    assert "ollama pull missing-model" in message
+    assert len(chat.calls) == 1
+
+
+def test_server_error_does_not_suggest_a_pull() -> None:
+    source = transcript_with("The lecture shows how a hash table stores keys.")
+    chat = FakeChat([ResponseError("overloaded", 500)])
+    with pytest.raises(ModelError, match="returned an error") as exc:
+        summarize(source, preset=PRESETS["short"], chat_model=chat, base_url="http://127.0.0.1:11434")
+    assert "ollama pull" not in str(exc.value)
     assert len(chat.calls) == 1
 
 

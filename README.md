@@ -81,7 +81,7 @@ temperature = 0.8
 
 - Exit code 1: the URL is invalid, captions are disabled, no transcript exists in the requested language, or `tldrtube_config.toml` cannot be used. The title and description are not sent to the model.
 - Exit code 2: the summary could not be tied to the transcript. tldrtube does not print a polished answer in that case.
-- Exit code 3: Ollama could not be reached, or the model did not return a readable summary.
+- Exit code 3: Ollama could not be reached, or the model did not return a readable summary. When the requested model is not installed, tldrtube lists the models Ollama has and points at `tldrtube_config.toml` or `ollama pull`.
 
 The checker rejects unknown segment ids, claims with no evidence, quotations that do not appear in the cited lines, and explicit numbers or names that the cited lines do not contain. A paraphrase can still misread a real quotation. When that cannot be ruled out, the claim is dropped rather than checked by a second model.
 

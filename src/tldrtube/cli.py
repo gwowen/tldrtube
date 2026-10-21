@@ -12,7 +12,12 @@ import sys
 
 from tldrtube.config import ConfigError, load_config
 from tldrtube.models import DEFAULT_MODEL, PRESETS, Claim, SummaryResponse, Transcript
-from tldrtube.summarizer import ModelError, resolve_base_url, summarize
+from tldrtube.summarizer import (
+    ModelError,
+    require_installed_model,
+    resolve_base_url,
+    summarize,
+)
 from tldrtube.transcript import TranscriptError, fetch_transcript, format_timestamp
 from tldrtube.verifier import VerificationError
 
@@ -98,13 +103,16 @@ def run(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"tldrtube: {exc}", file=sys.stderr)
         return 1
+    model = args.model if args.model is not None else settings.model
+    base_url = resolve_base_url(args.ollama_url)
     try:
+        require_installed_model(model, base_url)
         transcript = fetch_transcript(args.url, language=args.language)
         summary = summarize(
             transcript,
             preset=PRESETS[args.length],
-            model=args.model if args.model is not None else settings.model,
-            base_url=resolve_base_url(args.ollama_url),
+            model=model,
+            base_url=base_url,
             temperature=settings.temperature,
         )
     except TranscriptError as exc:
