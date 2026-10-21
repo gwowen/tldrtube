@@ -2,6 +2,7 @@
 
 import json
 
+import httpx
 import pytest
 
 from tldrtube.cli import render, run
@@ -60,9 +61,25 @@ def test_text_markdown_and_json_use_transcript_timestamps() -> None:
     assert payload["conclusion"]["timestamp"] == "1:02:05"
 
 
+def skip_model_check(monkeypatch) -> None:
+    monkeypatch.setattr("tldrtube.cli.require_installed_model", lambda *args, **kwargs: None)
+
+
+class _TagsResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
 def test_cli_writes_the_summary_to_stdout(monkeypatch, capsys) -> None:
     source = sample_transcript()
     summary = sample_summary()
+    skip_model_check(monkeypatch)
     monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
     monkeypatch.setattr("tldrtube.cli.summarize", lambda *args, **kwargs: summary)
     assert run([f"https://youtu.be/{VIDEO_ID}", "--format", "markdown"]) == 0
@@ -73,6 +90,7 @@ def test_cli_writes_the_summary_to_stdout(monkeypatch, capsys) -> None:
 
 def test_cli_exit_codes(monkeypatch, capsys) -> None:
     source = sample_transcript()
+    skip_model_check(monkeypatch)
 
     def fail_transcript(*args, **kwargs):
         raise TranscriptError("Captions are disabled for this video.")
@@ -104,3 +122,95 @@ def test_usage_error_exits_with_code_1() -> None:
     with pytest.raises(SystemExit) as exc:
         run([])
     assert exc.value.code == 1
+
+
+def test_config_supplies_model_and_temperature(monkeypatch, tmp_path, capsys) -> None:
+    (tmp_path / "tldrtube_config.toml").write_text(
+        'model = "config-model"\ntemperature = 0.2\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    source = sample_transcript()
+    summary = sample_summary()
+    seen: dict[str, object] = {}
+
+    def capture(*args, **kwargs):
+        seen["model"] = kwargs["model"]
+        seen["temperature"] = kwargs["temperature"]
+        return summary
+
+    skip_model_check(monkeypatch)
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
+    monkeypatch.setattr("tldrtube.cli.summarize", capture)
+    assert run([VIDEO_ID]) == 0
+    assert seen == {"model": "config-model", "temperature": 0.2}
+    capsys.readouterr()
+
+    assert run([VIDEO_ID, "--model", "flag-model"]) == 0
+    assert seen["model"] == "flag-model"
+    assert seen["temperature"] == 0.2
+
+
+def test_invalid_config_exits_before_fetch(monkeypatch, tmp_path, capsys) -> None:
+    (tmp_path / "tldrtube_config.toml").write_text("temperature = -1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("transcript fetch should not run")
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", fail_fetch)
+    assert run([VIDEO_ID]) == 1
+    captured = capsys.readouterr()
+    assert "temperature must be 0 or greater" in captured.err
+    assert captured.out == ""
+
+
+def test_unreachable_ollama_skips_the_transcript(monkeypatch, capsys) -> None:
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("transcript fetch should not run")
+
+    def fail_tags(*args, **kwargs):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", fail_fetch)
+    monkeypatch.setattr("tldrtube.summarizer.httpx.get", fail_tags)
+    assert run([VIDEO_ID]) == 3
+    err = capsys.readouterr().err
+    assert "Start Ollama" in err
+    assert "ollama pull" not in err
+
+
+def test_missing_model_skips_the_transcript_and_lists_installed_models(monkeypatch, capsys) -> None:
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("transcript fetch should not run")
+
+    def tags(*args, **kwargs):
+        return _TagsResponse({"models": [{"name": "gemma3:4b"}, {"model": "llama3.2:latest"}]})
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", fail_fetch)
+    monkeypatch.setattr("tldrtube.summarizer.httpx.get", tags)
+    assert run([VIDEO_ID, "--model", "missing-model"]) == 3
+    err = capsys.readouterr().err
+    assert "gemma3:4b" in err
+    assert "llama3.2:latest" in err
+    assert "tldrtube_config.toml" in err
+    assert "ollama pull missing-model" in err
+
+
+def test_installed_model_still_fetches_the_transcript(monkeypatch, capsys) -> None:
+    source = sample_transcript()
+    fetched = {"called": False}
+
+    def fetch(*args, **kwargs):
+        fetched["called"] = True
+        return source
+
+    def tags(*args, **kwargs):
+        return _TagsResponse({"models": [{"name": DEFAULT_MODEL}]})
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", fetch)
+    monkeypatch.setattr("tldrtube.cli.summarize", lambda *args, **kwargs: sample_summary())
+    monkeypatch.setattr("tldrtube.summarizer.httpx.get", tags)
+    assert run([VIDEO_ID, "--model", DEFAULT_MODEL]) == 0
+    assert fetched["called"] is True
+    capsys.readouterr()

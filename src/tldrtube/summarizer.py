@@ -17,6 +17,7 @@ from langchain_ollama import ChatOllama
 from ollama import RequestError, ResponseError
 from pydantic import BaseModel, ValidationError
 
+from tldrtube.config import DEFAULT_TEMPERATURE
 from tldrtube.models import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
@@ -106,6 +107,118 @@ def resolve_base_url(explicit: str | None = None) -> str:
     return raw.rstrip("/")
 
 
+# A local tags request should fail quickly when the server is down.
+_TAGS_TIMEOUT_SECONDS = 5.0
+
+
+def require_installed_model(model: str, base_url: str) -> None:
+    """Raise ModelError when Ollama is down or does not have this model.
+
+    The tags endpoint is an inventory check. ChatOllama stays the only chat client.
+    base_url must already include its scheme, as from resolve_base_url.
+    """
+
+    installed = _installed_model_names(base_url)
+    if installed is None:
+        raise ModelError(_unreachable_message(base_url))
+    if not _model_is_installed(model, installed):
+        raise ModelError(_missing_model_message(model, base_url, installed))
+
+
+def _installed_model_names(base_url: str) -> list[str] | None:
+    """Names from GET /api/tags, or None when that list cannot be read."""
+
+    try:
+        response = httpx.get(f"{base_url}/api/tags", timeout=_TAGS_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError, OSError):
+        return None
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return None
+    names: list[str] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("name") or item.get("model")
+        if isinstance(raw, str) and raw.strip():
+            names.append(raw.strip())
+    return names
+
+
+def _model_is_installed(requested: str, installed: Sequence[str]) -> bool:
+    """Exact name, or name:tag when the request itself has no tag."""
+
+    for name in installed:
+        if requested == name:
+            return True
+        if ":" not in requested and name.startswith(f"{requested}:"):
+            return True
+    return False
+
+
+def _unreachable_message(base_url: str, detail: object | None = None) -> str:
+    reason = f": {detail}" if detail else ""
+    return f"Could not reach Ollama at {base_url}{reason}. Start Ollama and try again."
+
+
+def _missing_model_message(model: str, base_url: str, installed: Sequence[str]) -> str:
+    if installed:
+        listed = "\n".join(f"- {name}" for name in installed)
+        inventory = f"Installed models:\n{listed}"
+        choice = (
+            "Change model in tldrtube_config.toml to one of those, or pass it with --model."
+        )
+    else:
+        inventory = "Ollama has no installed models."
+        choice = ""
+    download = f"To download the requested model, run: ollama pull {model}"
+    lines = [
+        f'Model "{model}" is not installed in Ollama at {base_url}.',
+        inventory,
+    ]
+    if choice:
+        lines.append(choice)
+    lines.append(download)
+    return "\n".join(lines)
+
+
+def _status_code(exc: BaseException) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+    return None
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (httpx.ConnectError, httpx.TimeoutException, ConnectionError, TimeoutError),
+    )
+
+
+def _is_missing_model(exc: BaseException) -> bool:
+    if _status_code(exc) == 404:
+        return True
+    return "not found" in str(exc).lower()
+
+
+def _failure_message(exc: BaseException, *, model: str, base_url: str) -> str:
+    if _is_unreachable(exc):
+        return _unreachable_message(base_url, exc)
+    if _is_missing_model(exc):
+        installed = _installed_model_names(base_url)
+        if installed is None:
+            return _unreachable_message(base_url, exc)
+        return _missing_model_message(model, base_url, installed)
+    return f"Ollama at {base_url} using model {model} returned an error: {exc}."
+
+
 def summarize(
     transcript: Transcript,
     *,
@@ -113,11 +226,12 @@ def summarize(
     model: str = DEFAULT_MODEL,
     base_url: str | None = None,
     chat_model: object | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
 ) -> SummaryResponse:
     """Summarise in one pass, or extract per chunk and then condense.
 
     chat_model is an optional stand-in for tests. Production builds a ChatOllama
-    client with a bounded token budget.
+    client with a bounded token budget. temperature comes from tldrtube_config.toml.
     """
 
     resolved_url = resolve_base_url(base_url)
@@ -141,6 +255,7 @@ def summarize(
             model=model,
             base_url=resolved_url,
             chat_model=chat_model,
+            temperature=temperature,
         )
     logger.info("Splitting the transcript into %s chunks.", len(chunks))
     return _summarize_long(
@@ -150,6 +265,7 @@ def summarize(
         model=model,
         base_url=resolved_url,
         chat_model=chat_model,
+        temperature=temperature,
     )
 
 
@@ -161,8 +277,16 @@ def _summarize_span(
     model: str,
     base_url: str,
     chat_model: object | None,
+    temperature: float,
 ) -> SummaryResponse:
-    runnable = _bind(SummaryResponse, preset.num_predict, model, base_url, chat_model)
+    runnable = _bind(
+        SummaryResponse,
+        preset.num_predict,
+        model,
+        base_url,
+        chat_model,
+        temperature,
+    )
     allowed = [segment.id for segment in segments]
 
     def user_text(problems: list[str]) -> str:
@@ -188,6 +312,7 @@ def _summarize_long(
     model: str,
     base_url: str,
     chat_model: object | None,
+    temperature: float,
 ) -> SummaryResponse:
     candidates: list[Claim] = []
     empty_spans: list[str] = []
@@ -200,6 +325,7 @@ def _summarize_long(
             model=model,
             base_url=base_url,
             chat_model=chat_model,
+            temperature=temperature,
             transcript=transcript,
             index=index,
             total=len(chunks),
@@ -222,7 +348,14 @@ def _summarize_long(
             "spans did not yield supported points."
         )
 
-    runnable = _bind(SummaryResponse, preset.num_predict, model, base_url, chat_model)
+    runnable = _bind(
+        SummaryResponse,
+        preset.num_predict,
+        model,
+        base_url,
+        chat_model,
+        temperature,
+    )
 
     def user_text(problems: list[str]) -> str:
         return _condense_prompt(candidates, empty_spans, transcript, preset, problems)
@@ -252,6 +385,7 @@ def _extract_chunk(
     model: str,
     base_url: str,
     chat_model: object | None,
+    temperature: float,
     transcript: Transcript,
     index: int,
     total: int,
@@ -263,7 +397,14 @@ def _extract_chunk(
     lookback is dropped.
     """
 
-    runnable = _bind(ExtractResponse, EXTRACT_NUM_PREDICT, model, base_url, chat_model)
+    runnable = _bind(
+        ExtractResponse,
+        EXTRACT_NUM_PREDICT,
+        model,
+        base_url,
+        chat_model,
+        temperature,
+    )
     segments = {segment.id: segment for segment in transcript.segments}
     context_ids = {segment.id for segment in chunk.context}
     allowed = [segment.id for segment in (*chunk.context, *chunk.segments)]
@@ -358,20 +499,25 @@ def _bind(
     model: str,
     base_url: str,
     chat_model: object | None,
+    temperature: float,
 ) -> object:
     """Bind the schema with Ollama's native JSON schema, not its tool API."""
 
-    client = chat_model if chat_model is not None else _chat_model(model, base_url, num_predict)
+    client = (
+        chat_model
+        if chat_model is not None
+        else _chat_model(model, base_url, num_predict, temperature)
+    )
     return client.with_structured_output(schema, method="json_schema")
 
 
-def _chat_model(model: str, base_url: str, num_predict: int) -> ChatOllama:
-    # Temperature is zero so the same transcript does not drift between runs.
+def _chat_model(model: str, base_url: str, num_predict: int, temperature: float) -> ChatOllama:
+    # Temperature comes from tldrtube_config.toml and defaults to Ollama's 0.8.
     # reasoning is off so this agentic checkpoint spends the token budget on the summary.
     return ChatOllama(
         model=model,
         base_url=base_url,
-        temperature=0,
+        temperature=temperature,
         num_predict=num_predict,
         reasoning=False,
     )
@@ -405,10 +551,7 @@ def _invoke(runnable: object, system: str, user: str, *, model: str, base_url: s
     except _PARSE_FAILURES as exc:
         raise _UnusableResponse(str(exc)) from exc
     except _MODEL_FAILURES as exc:
-        raise ModelError(
-            f"Could not reach Ollama at {base_url} using model {model}: {exc}. "
-            f"Start Ollama and pull the model with: ollama pull {model}"
-        ) from exc
+        raise ModelError(_failure_message(exc, model=model, base_url=base_url)) from exc
 
 
 def _span_prompt(

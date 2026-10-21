@@ -1,0 +1,2 @@
+model = "LiquidAI/lfm2.5-2.6b"
+temperature = 0.8

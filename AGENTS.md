@@ -6,7 +6,7 @@ tldrtube summarises a YouTube transcript with a local model. The model may conde
 
 Python owns retrieval, normalisation, chunking, segment ids, timestamps, verification, and rendering.
 
-`langchain_ollama.ChatOllama` is the only model client. Bind it with `with_structured_output(..., method="json_schema")`, `temperature=0`, a bounded `num_predict`, and `reasoning=False`. Do not add agents, tools, embeddings, vector stores, or a second model that checks the summary.
+`langchain_ollama.ChatOllama` is the only model client. Bind it with `with_structured_output(..., method="json_schema")`, the temperature from `tldrtube_config.toml` (default `0.8`, which is Ollama's default), a bounded `num_predict`, and `reasoning=False`. Do not add agents, tools, embeddings, vector stores, or a second model that checks the summary.
 
 ## Transcripts
 
@@ -24,7 +24,7 @@ Timestamps shown to the user are computed from the cited segments.
 
 ## Layout
 
-Keep the `src/` layout and Python 3.11. The modules are `models`, `transcript`, `summarizer`, `verifier`, and `cli`. Tests stay offline: mock transcript fetch and inject a fake chat model.
+Keep the `src/` layout and Python 3.11. The modules are `models`, `transcript`, `summarizer`, `verifier`, `config`, and `cli`. Tests stay offline: mock transcript fetch and inject a fake chat model.
 
 ## License
 

@@ -10,8 +10,14 @@ import json
 import logging
 import sys
 
+from tldrtube.config import ConfigError, load_config
 from tldrtube.models import DEFAULT_MODEL, PRESETS, Claim, SummaryResponse, Transcript
-from tldrtube.summarizer import ModelError, resolve_base_url, summarize
+from tldrtube.summarizer import (
+    ModelError,
+    require_installed_model,
+    resolve_base_url,
+    summarize,
+)
 from tldrtube.transcript import TranscriptError, fetch_transcript, format_timestamp
 from tldrtube.verifier import VerificationError
 
@@ -68,8 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help=f"Ollama model name (default: {DEFAULT_MODEL})",
+        default=None,
+        help=(
+            f"Ollama model name (default: {DEFAULT_MODEL}, "
+            "or model in tldrtube_config.toml)"
+        ),
     )
     parser.add_argument(
         "--language",
@@ -90,12 +99,21 @@ def run(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging()
     try:
+        settings = load_config()
+    except ConfigError as exc:
+        print(f"tldrtube: {exc}", file=sys.stderr)
+        return 1
+    model = args.model if args.model is not None else settings.model
+    base_url = resolve_base_url(args.ollama_url)
+    try:
+        require_installed_model(model, base_url)
         transcript = fetch_transcript(args.url, language=args.language)
         summary = summarize(
             transcript,
             preset=PRESETS[args.length],
-            model=args.model,
-            base_url=resolve_base_url(args.ollama_url),
+            model=model,
+            base_url=base_url,
+            temperature=settings.temperature,
         )
     except TranscriptError as exc:
         # Missing captions are a data failure, not a reason to invent a summary.
