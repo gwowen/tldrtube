@@ -1,0 +1,15 @@
+{
+  "notes": "Reference summary: the speaker first says the policy will cut household costs, then says the same policy will raise costs. Both statements stay in the transcript so a summary can attribute the contradiction to the speaker.",
+  "segments": [
+    {
+      "start": 1.0,
+      "duration": 3.0,
+      "text": "This policy will cut costs for every household."
+    },
+    {
+      "start": 6.0,
+      "duration": 4.0,
+      "text": "Actually, the same policy will raise costs next year."
+    }
+  ]
+}

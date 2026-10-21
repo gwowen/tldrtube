@@ -1,0 +1,106 @@
+"""Command-line rendering and exit codes."""
+
+import json
+
+import pytest
+
+from tldrtube.cli import render, run
+from tldrtube.models import DEFAULT_MODEL, Claim, SummaryResponse
+from tldrtube.summarizer import ModelError
+from tldrtube.transcript import TranscriptError, build_transcript
+from tldrtube.verifier import VerificationError
+
+VIDEO_ID = "dQw4w9WgXcQ"
+
+
+def sample_transcript():
+    return build_transcript(
+        video_id=VIDEO_ID,
+        language="English",
+        language_code="en",
+        is_generated=False,
+        snippets=[
+            (134.0, 2.0, "The central example starts here."),
+            (3725.0, 2.0, "The closing example comes much later."),
+        ],
+    )
+
+
+def sample_summary() -> SummaryResponse:
+    return SummaryResponse(
+        main_idea=Claim(text="The video explains the central example.", evidence_ids=["s1"]),
+        key_points=[
+            Claim(text="The closing example comes later.", evidence_ids=["s2", "s1"]),
+        ],
+        conclusion=Claim(text="The speaker closes on the later example.", evidence_ids=["s2"]),
+        limitations=["Some transcript spans did not yield a supported point."],
+    )
+
+
+def test_text_markdown_and_json_use_transcript_timestamps() -> None:
+    source = sample_transcript()
+    summary = sample_summary()
+    text = render(summary, source, "text")
+    assert text.startswith("TL;DR\n")
+    assert "**TL;DR**" not in text
+    assert "- The closing example comes later. — [02:14]" in text
+    assert "- The speaker closes on the later example. — [1:02:05]" in text
+    assert "Limitations" in text
+
+    markdown = render(summary, source, "markdown")
+    assert "**TL;DR**" in markdown
+    assert "**Key points**" in markdown
+    assert "**Limitations**" in markdown
+
+    payload = json.loads(render(summary, source, "json"))
+    assert payload["video_id"] == VIDEO_ID
+    assert payload["main_idea"]["timestamp"] == "02:14"
+    assert payload["key_points"][0]["timestamp"] == "02:14"
+    assert payload["key_points"][0]["evidence_ids"] == ["s2", "s1"]
+    assert payload["conclusion"]["timestamp"] == "1:02:05"
+
+
+def test_cli_writes_the_summary_to_stdout(monkeypatch, capsys) -> None:
+    source = sample_transcript()
+    summary = sample_summary()
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
+    monkeypatch.setattr("tldrtube.cli.summarize", lambda *args, **kwargs: summary)
+    assert run([f"https://youtu.be/{VIDEO_ID}", "--format", "markdown"]) == 0
+    captured = capsys.readouterr()
+    assert "**TL;DR**" in captured.out
+    assert captured.err == ""
+
+
+def test_cli_exit_codes(monkeypatch, capsys) -> None:
+    source = sample_transcript()
+
+    def fail_transcript(*args, **kwargs):
+        raise TranscriptError("Captions are disabled for this video.")
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", fail_transcript)
+    assert run([VIDEO_ID]) == 1
+    captured = capsys.readouterr()
+    assert "Captions are disabled" in captured.err
+    assert captured.out == ""
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
+
+    def fail_verification(*args, **kwargs):
+        raise VerificationError("A faithful summary could not be produced.")
+
+    monkeypatch.setattr("tldrtube.cli.summarize", fail_verification)
+    assert run([VIDEO_ID]) == 2
+    assert "faithful summary" in capsys.readouterr().err
+
+    def fail_model(*args, **kwargs):
+        raise ModelError("Could not reach Ollama.")
+
+    monkeypatch.setattr("tldrtube.cli.summarize", fail_model)
+    assert run([VIDEO_ID, "--model", DEFAULT_MODEL]) == 3
+    assert "Ollama" in capsys.readouterr().err
+
+
+def test_usage_error_exits_with_code_1() -> None:
+    with pytest.raises(SystemExit) as exc:
+        run([])
+    assert exc.value.code == 1

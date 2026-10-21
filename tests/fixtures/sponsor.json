@@ -1,0 +1,20 @@
+{
+  "notes": "Reference summary: tides are caused by the pull of the moon. The opening sponsorship is part of the transcript and must not be deleted before summarisation.",
+  "segments": [
+    {
+      "start": 0.0,
+      "duration": 3.0,
+      "text": "This video is sponsored by Acme Widgets."
+    },
+    {
+      "start": 4.0,
+      "duration": 4.0,
+      "text": "Tides are caused by the pull of the moon."
+    },
+    {
+      "start": 9.0,
+      "duration": 3.0,
+      "text": "This video is sponsored by Acme Widgets."
+    }
+  ]
+}

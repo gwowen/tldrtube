@@ -1,0 +1,28 @@
+[project]
+name = "tldrtube"
+version = "0.1.0"
+description = "Concise, evidence-grounded summaries of YouTube videos using a local language model."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Gareth Owen", email = "gareth.w.owen@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-ollama",
+    "pydantic>=2",
+    "youtube-transcript-api",
+]
+
+[project.scripts]
+tldrtube = "tldrtube.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
