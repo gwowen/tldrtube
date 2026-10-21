@@ -104,3 +104,43 @@ def test_usage_error_exits_with_code_1() -> None:
     with pytest.raises(SystemExit) as exc:
         run([])
     assert exc.value.code == 1
+
+
+def test_config_supplies_model_and_temperature(monkeypatch, tmp_path, capsys) -> None:
+    (tmp_path / "tldrtube_config.toml").write_text(
+        'model = "config-model"\ntemperature = 0.2\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    source = sample_transcript()
+    summary = sample_summary()
+    seen: dict[str, object] = {}
+
+    def capture(*args, **kwargs):
+        seen["model"] = kwargs["model"]
+        seen["temperature"] = kwargs["temperature"]
+        return summary
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
+    monkeypatch.setattr("tldrtube.cli.summarize", capture)
+    assert run([VIDEO_ID]) == 0
+    assert seen == {"model": "config-model", "temperature": 0.2}
+    capsys.readouterr()
+
+    assert run([VIDEO_ID, "--model", "flag-model"]) == 0
+    assert seen["model"] == "flag-model"
+    assert seen["temperature"] == 0.2
+
+
+def test_invalid_config_exits_before_fetch(monkeypatch, tmp_path, capsys) -> None:
+    (tmp_path / "tldrtube_config.toml").write_text("temperature = -1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("transcript fetch should not run")
+
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", fail_fetch)
+    assert run([VIDEO_ID]) == 1
+    captured = capsys.readouterr()
+    assert "temperature must be 0 or greater" in captured.err
+    assert captured.out == ""

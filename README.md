@@ -56,7 +56,7 @@ tldrtube URL --language en
 tldrtube URL --ollama-url http://127.0.0.1:11434
 ```
 
-The default length is medium and the default format is plain text. Progress is printed to stderr while the summary is written to stdout. `OLLAMA_HOST` is used when `--ollama-url` is omitted. If the host has no scheme, `http://` is added.
+`--model` replaces the model named in `tldrtube_config.toml`. The default length is medium and the default format is plain text. Progress is printed to stderr while the summary is written to stdout. `OLLAMA_HOST` is used when `--ollama-url` is omitted. If the host has no scheme, `http://` is added.
 
 | Preset | Words | Points |
 | --- | --- | --- |
@@ -66,9 +66,20 @@ The default length is medium and the default format is plain text. Progress is p
 
 Timestamps such as `[02:14]` come from the cited caption, not from the model. JSON includes the same timestamps alongside the evidence ids.
 
+## Configuration
+
+tldrtube reads `tldrtube_config.toml` from the current working directory. A missing file uses the built-in defaults, so an installed command still runs from any directory. This repository includes a file with those defaults:
+
+```toml
+model = "LiquidAI/lfm2.5-2.6b"
+temperature = 0.8
+```
+
+`model` is the Ollama model name. `temperature` is sent to Ollama. `0.8` is Ollama's own default, so two runs of the same video can differ. A present file may omit either key. An unknown key, a model that is not a non-empty string, a temperature that is not a number, or a negative temperature stops the program with exit code 1.
+
 ## What a failure means
 
-- Exit code 1: the URL is invalid, captions are disabled, or no transcript exists in the requested language. The title and description are not sent to the model.
+- Exit code 1: the URL is invalid, captions are disabled, no transcript exists in the requested language, or `tldrtube_config.toml` cannot be used. The title and description are not sent to the model.
 - Exit code 2: the summary could not be tied to the transcript. tldrtube does not print a polished answer in that case.
 - Exit code 3: Ollama could not be reached, or the model did not return a readable summary.
 
