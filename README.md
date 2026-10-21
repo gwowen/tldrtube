@@ -1,6 +1,12 @@
 # tldrtube
 
-tldrtube is a command-line tool that writes a short, evidence-grounded summary of a YouTube video from its transcript. A local model, served by [Ollama](https://ollama.com/), condenses the words that were spoken. Python checks that every retained claim points at a real transcript segment.
+Too many videos, too little time? Wondering about whether that epic hour long YouTube video is for you and just want to get the gist of it? 
+
+Well, tldrtube is for you!
+
+tldrtube is a command-line tool that writes a short, evidence-grounded summary of a YouTube video from its transcript when provided with a YouTube URL. 
+
+A local model, served by [Ollama](https://ollama.com/), condenses the words that were spoken. Python checks that every retained claim points at a real transcript segment.
 
 The model may condense, reorganise, and paraphrase. It must not add facts, names, statistics, or recommendations that the transcript does not support. tldrtube does not watch the video, read the title or description, or check claims against the web. Material that appears only on screen is missing from the summary.
 
