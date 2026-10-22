@@ -140,10 +140,19 @@ def format_timestamp(start: float) -> str:
 
 
 def format_segment_line(segment: Segment) -> str:
-    """One prompt line. The id is what the model may cite; the clock time is context."""
+    """One prompt line. The id in brackets is what the model may cite.
+
+    The clock time sits outside the brackets so it is not copied as part of the id.
+    """
 
     marker = " [non-speech]" if segment.non_speech else ""
-    return f"[{segment.id} {format_timestamp(segment.start)}]{marker} {segment.text}"
+    return f"[{segment.id}] {format_timestamp(segment.start)}{marker} {segment.text}"
+
+
+def utterance_continues(segment: Segment, following: Segment | None) -> bool:
+    """True when the next caption is still the same spoken thought."""
+
+    return following is not None and not _utterance_boundary(segment, following)
 
 
 def build_transcript(

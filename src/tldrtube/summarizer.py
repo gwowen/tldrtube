@@ -34,10 +34,12 @@ from tldrtube.models import (
 from tldrtube.transcript import chunk_transcript, format_segment_line, utterance_tail
 from tldrtube.verifier import (
     VerificationError,
+    cite_supporting_lines,
     claim_problems,
     normalize_claim,
     normalize_summary,
     order_key_points,
+    pin_continuations,
     review_summary,
     salvage,
 )
@@ -58,7 +60,7 @@ If a point is not supported by the transcript, omit it.
 
 Associate every factual statement with supporting transcript passages.
 
-Copy the id inside the brackets of each line that supports a statement. One id per line. A span is not an id. Each statement needs at least one evidence id and at most {MAX_EVIDENCE_IDS}. A name or number in a statement must appear in those lines.
+Copy only the id in brackets, such as s1. The clock time after the brackets is not an id. One id per line. A span is not an id. Each statement needs at least one evidence id and at most {MAX_EVIDENCE_IDS}. A name or number in a statement must appear in those lines.
 
 Prefer concise, direct language. Do not add introductory filler.
 
@@ -390,11 +392,12 @@ def _extract_chunk(
     index: int,
     total: int,
 ) -> list[Claim] | None:
-    """Extract one chunk. Retry once, then keep only the points that cite this span.
+    """Extract one chunk. Retry once, then keep the supported points.
 
-    Returns None when both attempts are unreadable. The last readable response
-    is kept if the retry itself cannot be parsed. A point that cites only the
-    lookback is dropped.
+    Returns None when both attempts are unreadable. A point that cites only the
+    lookback is dropped. Repair may add a line from this span or its lookback,
+    including the next caption when a wrapped name needs it. The attempt with
+    more supported points is kept.
     """
 
     runnable = _bind(
@@ -408,12 +411,14 @@ def _extract_chunk(
     segments = {segment.id: segment for segment in transcript.segments}
     context_ids = {segment.id for segment in chunk.context}
     allowed = [segment.id for segment in (*chunk.context, *chunk.segments)]
+    allowed_ids = set(allowed)
     problems: list[str] = []
-    parsed: ExtractResponse | None = None
+    kept_attempts: list[list[Claim]] = []
     label = _chunk_label(chunk, index, total)
     for attempt in range(2):
         if attempt:
             logger.info("The points from %s were not accepted. Asking once more.", label)
+            _log_problems(problems)
         else:
             logger.info("Extracting key points from %s.", label)
         try:
@@ -425,34 +430,73 @@ def _extract_chunk(
                 base_url=base_url,
             )
             parsed = _coerce(ExtractResponse, value)
-            parsed = parsed.model_copy(
-                update={"points": [normalize_claim(point, segments) for point in parsed.points]}
-            )
+            points = [
+                pin_continuations(normalize_claim(point, segments), segments, allowed_ids)
+                for point in parsed.points
+            ]
         except _UnusableResponse:
             problems = [_schema_problem()]
             continue
         problems = []
-        for point_index, point in enumerate(parsed.points, start=1):
-            problems.extend(claim_problems(f"Candidate point {point_index}", point, segments))
+        for point_index, point in enumerate(points, start=1):
+            problems.extend(
+                claim_problems(
+                    f"Candidate point {point_index}",
+                    point,
+                    segments,
+                    allowed_ids,
+                )
+            )
             if _context_only(point, context_ids):
                 problems.append(
                     f"Candidate point {point_index} cites only the already covered context. "
                     "Cite at least one segment id from this span, or omit the point."
                 )
         if not problems:
-            logger.info("Supported points from %s: %s.", label, len(parsed.points))
-            return list(parsed.points)
-    if parsed is None:
+            logger.info("Supported points from %s: %s.", label, len(points))
+            return points
+        kept_attempts.append(
+            _supported_points(points, segments, context_ids, allowed_ids)
+        )
+    _log_problems(problems)
+    if not kept_attempts:
         logger.info("Could not read %s.", label)
         return None
-    kept = [
-        point
-        for point in parsed.points
-        if not claim_problems("Candidate point", point, segments)
-        and not _context_only(point, context_ids)
-    ]
+    kept = kept_attempts[0]
+    for candidate in kept_attempts[1:]:
+        if len(candidate) >= len(kept):
+            kept = candidate
     logger.info("Keeping %s supported points from %s.", len(kept), label)
     return kept
+
+
+def _supported_points(
+    points: list[Claim],
+    segments: dict[str, Segment],
+    context_ids: set[str],
+    allowed_ids: set[str],
+) -> list[Claim]:
+    """Drop points that still fail after repair inside this span."""
+
+    kept: list[Claim] = []
+    for point in points:
+        if _context_only(point, context_ids):
+            continue
+        current = point
+        if claim_problems("Candidate point", current, segments, allowed_ids):
+            repaired = cite_supporting_lines(current, segments, allowed_ids)
+            if repaired is None or _context_only(repaired, context_ids):
+                continue
+            if claim_problems("Candidate point", repaired, segments, allowed_ids):
+                continue
+            current = repaired
+        kept.append(current)
+    return kept
+
+
+def _log_problems(problems: list[str]) -> None:
+    for problem in problems:
+        logger.info("%s", problem)
 
 
 def _generate(
@@ -473,6 +517,7 @@ def _generate(
     for attempt in range(2):
         if attempt:
             logger.info("The response was not accepted. Asking the model to correct it.")
+            _log_problems(problems)
         else:
             logger.info(activity)
         try:
@@ -486,9 +531,11 @@ def _generate(
             logger.info("The summary passed the evidence checks.")
             return order_key_points(parsed, transcript)
     if parsed is None:
+        _log_problems(problems)
         raise ModelError(
             "The model returned a response that could not be read as the expected summary."
         )
+    _log_problems(problems)
     logger.info("Removing claims that are not supported by the transcript.")
     return salvage(parsed, transcript, preset)
 
@@ -657,7 +704,7 @@ def _evidence_rule(segment_count: int) -> str:
     line = "line" if segment_count == 1 else "lines"
     return (
         f"The transcript has {segment_count} {line}. "
-        "Copy the id inside the brackets of each supporting line. "
+        "Copy only the id in brackets. The clock time after the brackets is not an id. "
         "One id per line. A span is not an id. "
         f"Use from 1 to {MAX_EVIDENCE_IDS} ids. "
         "An empty list is invalid."
