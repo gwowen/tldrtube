@@ -9,7 +9,7 @@ idea fails, the summary is refused.
 import re
 
 from tldrtube.models import MAX_EVIDENCE_IDS, Claim, LengthPreset, Segment, SummaryResponse, Transcript
-from tldrtube.transcript import collapse_whitespace
+from tldrtube.transcript import collapse_whitespace, utterance_continues
 
 _QUOTE = re.compile(r'["“”]([^"“”]{4,})["“”]')
 # Explicit numerals only. Spelled-out numbers such as "forty" are left alone.
@@ -23,6 +23,8 @@ _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
 # A model often writes a caption span instead of one id per line.
 _SPAN = re.compile(r"^s(\d+)\s*[-–—]\s*s?(\d+)$", re.IGNORECASE)
 _SINGLE = re.compile(r"^s(\d+)$", re.IGNORECASE)
+# A model often copies the clock time that follows the segment id.
+_CLOCK_SUFFIX = re.compile(r"\s+\[?\d{1,2}:\d{2}(?::\d{2})?\]?$")
 
 
 class VerificationError(Exception):
@@ -140,12 +142,22 @@ def salvage(
 
     summary = normalize_summary(summary, transcript)
     segments = _index(transcript)
+    summary = SummaryResponse(
+        main_idea=pin_continuations(summary.main_idea, segments),
+        key_points=[pin_continuations(point, segments) for point in summary.key_points],
+        conclusion=(
+            None
+            if summary.conclusion is None
+            else pin_continuations(summary.conclusion, segments)
+        ),
+        limitations=summary.limitations,
+    )
     limitations = _clean_limitations(summary.limitations)
     cited_extra = False
     main_idea = summary.main_idea
     main_problems = claim_problems("The main idea", main_idea, segments)
     if main_problems:
-        repaired = _cite_supporting_lines(main_idea, segments)
+        repaired = cite_supporting_lines(main_idea, segments)
         if repaired is None:
             raise VerificationError(
                 "A faithful summary could not be produced. " + " ".join(main_problems)
@@ -157,7 +169,7 @@ def salvage(
     for index, point in enumerate(summary.key_points, start=1):
         problems = claim_problems(f"Key point {index}", point, segments)
         if problems:
-            repaired = _cite_supporting_lines(point, segments)
+            repaired = cite_supporting_lines(point, segments)
             if repaired is None:
                 limitations.append(
                     f"Removed key point {index} because it was not supported by the cited transcript."
@@ -169,7 +181,7 @@ def salvage(
 
     conclusion = summary.conclusion
     if conclusion is not None and claim_problems("The conclusion", conclusion, segments):
-        repaired = _cite_supporting_lines(conclusion, segments)
+        repaired = cite_supporting_lines(conclusion, segments)
         if repaired is None:
             limitations.append(
                 "Removed the conclusion because it was not supported by the cited transcript."
@@ -196,90 +208,144 @@ def salvage(
     return trimmed.model_copy(update={"limitations": _dedupe(trimmed.limitations)})
 
 
-def _cite_supporting_lines(claim: Claim, segments: dict[str, Segment]) -> Claim | None:
+def cite_supporting_lines(
+    claim: Claim,
+    segments: dict[str, Segment],
+    allowed: set[str] | None = None,
+) -> Claim | None:
     """Add lines that contain a name, number, or quotation the claim already uses.
 
-    Returns None when one of those tokens appears nowhere in the transcript, or
-    when the claim still fails after the lines are added. The claim text stays
-    unchanged.
+    Returns None when one of those tokens appears nowhere in the searched lines,
+    or when the claim still fails after the lines are added. The claim text stays
+    unchanged. ``allowed`` limits the search to one chunk and its lookback.
     """
 
     if not claim.text.strip():
         return None
     resolved, unresolved = _resolve_evidence_ids(claim.evidence_ids, claim.text, segments)
-    needed = _lines_for_missing_anchors(claim.text, resolved, segments)
+    needed = _lines_for_missing_anchors(claim.text, resolved, segments, allowed)
     if needed is None:
         return None
     if not needed:
         if not unresolved or not resolved:
             return None
-        repaired = claim.model_copy(update={"evidence_ids": resolved})
-        if claim_problems("Claim", repaired, segments):
+        repaired = pin_continuations(
+            claim.model_copy(update={"evidence_ids": resolved}),
+            segments,
+            allowed,
+        )
+        if claim_problems("Claim", repaired, segments, allowed):
             return None
         return repaired
     chosen: list[str] = []
     for sid in needed + resolved:
+        if allowed is not None and sid not in allowed:
+            continue
         if sid not in chosen:
             chosen.append(sid)
         if len(chosen) == MAX_EVIDENCE_IDS:
             break
+    if not chosen:
+        return None
     ordered = sorted(chosen, key=lambda sid: (segments[sid].start, sid))
-    repaired = claim.model_copy(update={"evidence_ids": ordered})
-    if claim_problems("Claim", repaired, segments):
+    repaired = pin_continuations(
+        claim.model_copy(update={"evidence_ids": ordered}),
+        segments,
+        allowed,
+    )
+    if claim_problems("Claim", repaired, segments, allowed):
         return None
     return repaired
+
+
+def pin_continuations(
+    claim: Claim,
+    segments: dict[str, Segment],
+    allowed: set[str] | None = None,
+) -> Claim:
+    """Cite the next caption when an anchor matches only together with it.
+
+    A wrapped auto-caption splits a name across two short lines. Citing the
+    first line is enough for the check; this stores the continuation as well.
+    """
+
+    resolved, unresolved = _resolve_evidence_ids(claim.evidence_ids, claim.text, segments)
+    if unresolved or not resolved:
+        return claim
+    if _anchors_supported(claim.text, _join_ids(resolved, segments)):
+        if resolved == [item.strip() for item in claim.evidence_ids]:
+            return claim
+        return claim.model_copy(update={"evidence_ids": resolved})
+    extended = list(resolved)
+    for sid in list(resolved):
+        nxt = _continuation_id(sid, segments)
+        if nxt is None or nxt in extended:
+            continue
+        if allowed is not None and nxt not in allowed:
+            continue
+        if len(extended) >= MAX_EVIDENCE_IDS:
+            break
+        extended.append(nxt)
+        if _anchors_supported(claim.text, _join_ids(extended, segments)):
+            break
+    if not _anchors_supported(claim.text, _join_ids(extended, segments)):
+        return claim
+    ordered = sorted(dict.fromkeys(extended), key=lambda sid: (segments[sid].start, sid))
+    return claim.model_copy(update={"evidence_ids": ordered})
 
 
 def _lines_for_missing_anchors(
     text: str,
     evidence_ids: list[str],
     segments: dict[str, Segment],
+    allowed: set[str] | None = None,
 ) -> list[str] | None:
-    """Line ids to add. None means a token in the claim appears nowhere."""
+    """Line ids to add. None means a token in the claim appears nowhere in scope."""
 
-    evidence = "\n".join(segments[sid].text for sid in evidence_ids if sid in segments)
+    evidence = _window_text(evidence_ids, segments)
     folded = collapse_whitespace(evidence).casefold()
     needed: list[str] = []
     cited = set(evidence_ids)
 
-    def add_first(found: list[Segment]) -> bool:
-        for segment in found:
-            if segment.id not in cited and segment.id not in needed:
-                needed.append(segment.id)
-                return True
-        return bool(found)
+    def add_first(hits: list[tuple[tuple[str, ...], str]]) -> bool:
+        if not hits:
+            return False
+        for sid in hits[0][0]:
+            if sid not in cited and sid not in needed:
+                needed.append(sid)
+        return True
 
     for quote in _quotes(text):
-        if collapse_whitespace(quote).casefold() in folded:
-            continue
         needle = collapse_whitespace(quote).casefold()
-        found = [
-            segment
-            for segment in segments.values()
-            if needle in collapse_whitespace(segment.text).casefold()
-        ]
-        if not add_first(found):
+        if needle in folded:
+            continue
+        hits = _anchor_hits(
+            segments,
+            lambda line, needle=needle: needle in collapse_whitespace(line).casefold(),
+            allowed,
+        )
+        if not add_first(hits):
             return None
     for number in _numbers(text):
         if _number_supported(number, evidence):
             continue
-        found = [
-            segment
-            for segment in segments.values()
-            if _number_supported(number, segment.text)
-        ]
-        if not add_first(found):
+        hits = _anchor_hits(
+            segments,
+            lambda line, number=number: _number_supported(number, line),
+            allowed,
+        )
+        if not add_first(hits):
             return None
     for name in _names(text):
         forms = _name_forms(name)
         if _folded_has_name(folded, forms):
             continue
-        found = [
-            segment
-            for segment in segments.values()
-            if _folded_has_name(collapse_whitespace(segment.text).casefold(), forms)
-        ]
-        if not add_first(found):
+        hits = _anchor_hits(
+            segments,
+            lambda line, forms=forms: _folded_has_name(collapse_whitespace(line).casefold(), forms),
+            allowed,
+        )
+        if not add_first(hits):
             return None
     return needed
 
@@ -288,11 +354,13 @@ def claim_problems(
     label: str,
     claim: Claim,
     segments: dict[str, Segment],
+    allowed: set[str] | None = None,
 ) -> list[str]:
     """Check one claim against the segments it cites.
 
-    Unknown ids stop the check. Comparing a quotation with lines the model did
-    not cite would make a bad citation look supported.
+    Unknown ids stop the check. A cited line that does not end its utterance
+    also searches the next caption, so a name wrapped across those two lines
+    still counts. ``allowed`` limits where a missing name or number is looked up.
     """
 
     problems: list[str] = []
@@ -310,7 +378,7 @@ def claim_problems(
         problems.append(f"{label} has no transcript evidence.")
         return problems
 
-    evidence = "\n".join(segments[item].text for item in evidence_ids)
+    evidence = _window_text(evidence_ids, segments)
     folded_evidence = collapse_whitespace(evidence).casefold()
     for quote in _quotes(claim.text):
         if collapse_whitespace(quote).casefold() not in folded_evidence:
@@ -320,16 +388,144 @@ def claim_problems(
     for number in _numbers(claim.text):
         if not _number_supported(number, evidence):
             problems.append(
-                _missing_number_problem(label, number, evidence_ids, segments)
+                _missing_number_problem(label, number, evidence_ids, segments, allowed)
             )
     for name in _names(claim.text):
         if not _folded_has_name(folded_evidence, _name_forms(name)):
-            problems.append(_missing_name_problem(label, name, evidence_ids, segments))
+            problems.append(
+                _missing_name_problem(label, name, evidence_ids, segments, allowed)
+            )
     return problems
 
 
 def _index(transcript: Transcript) -> dict[str, Segment]:
     return {segment.id: segment for segment in transcript.segments}
+
+
+def _ordered_segments(segments: dict[str, Segment]) -> list[Segment]:
+    return sorted(segments.values(), key=lambda segment: (segment.start, segment.id))
+
+
+def _continuation_id(segment_id: str, segments: dict[str, Segment]) -> str | None:
+    """The next caption when this one does not end the utterance."""
+
+    ordered = _ordered_segments(segments)
+    for index, segment in enumerate(ordered):
+        if segment.id != segment_id:
+            continue
+        if index + 1 >= len(ordered):
+            return None
+        nxt = ordered[index + 1]
+        if utterance_continues(segment, nxt):
+            return nxt.id
+        return None
+    return None
+
+
+def _window_ids(evidence_ids: list[str], segments: dict[str, Segment]) -> list[str]:
+    """Cited ids plus the next caption when the utterance continues."""
+
+    ordered = _ordered_segments(segments)
+    position = {segment.id: index for index, segment in enumerate(ordered)}
+    chosen: set[str] = set()
+    for sid in evidence_ids:
+        if sid not in position:
+            continue
+        chosen.add(sid)
+        index = position[sid]
+        if index + 1 >= len(ordered):
+            continue
+        nxt = ordered[index + 1]
+        if utterance_continues(ordered[index], nxt):
+            chosen.add(nxt.id)
+    return [segment.id for segment in ordered if segment.id in chosen]
+
+
+def _join_ids(ids: list[str], segments: dict[str, Segment]) -> str:
+    chosen = set(ids)
+    ordered = _ordered_segments(segments)
+    return "\n".join(segment.text for segment in ordered if segment.id in chosen)
+
+
+def _window_text(evidence_ids: list[str], segments: dict[str, Segment]) -> str:
+    return _join_ids(_window_ids(evidence_ids, segments), segments)
+
+
+def _anchors_supported(text: str, evidence: str) -> bool:
+    folded = collapse_whitespace(evidence).casefold()
+    for quote in _quotes(text):
+        if collapse_whitespace(quote).casefold() not in folded:
+            return False
+    for number in _numbers(text):
+        if not _number_supported(number, evidence):
+            return False
+    for name in _names(text):
+        if not _folded_has_name(folded, _name_forms(name)):
+            return False
+    return True
+
+
+def _anchor_hits(
+    segments: dict[str, Segment],
+    predicate,
+    allowed: set[str] | None = None,
+) -> list[tuple[tuple[str, ...], str]]:
+    """Lines that match. A wrapped pair is used only when no single line does."""
+
+    ordered = _ordered_segments(segments)
+    singles: list[tuple[tuple[str, ...], str]] = []
+    for segment in ordered:
+        if allowed is not None and segment.id not in allowed:
+            continue
+        if predicate(segment.text):
+            singles.append(((segment.id,), segment.text))
+    if singles:
+        return singles
+    pairs: list[tuple[tuple[str, ...], str]] = []
+    for index, segment in enumerate(ordered[:-1]):
+        nxt = ordered[index + 1]
+        if not utterance_continues(segment, nxt):
+            continue
+        if allowed is not None and (segment.id not in allowed or nxt.id not in allowed):
+            continue
+        joined = f"{segment.text} {nxt.text}"
+        if predicate(joined):
+            pairs.append(((segment.id, nxt.id), joined))
+    return pairs
+
+
+def _fresh_hits(
+    hits: list[tuple[tuple[str, ...], str]],
+    cited: set[str],
+) -> list[tuple[tuple[str, ...], str]]:
+    """Hits that include a line the claim did not already cite."""
+
+    return [hit for hit in hits if any(sid not in cited for sid in hit[0])]
+
+
+def _missing_anchor_message(
+    problem: str,
+    hits: list[tuple[tuple[str, ...], str]],
+    allowed: set[str] | None,
+    kind: str,
+) -> str:
+    if not hits:
+        scope = "in this span" if allowed is not None else "anywhere in the transcript"
+        return f"{problem} It does not appear {scope}. Remove the {kind}."
+    ids: list[str] = []
+    for hit_ids, _text in hits:
+        for sid in hit_ids:
+            if sid not in ids:
+                ids.append(sid)
+            if len(ids) == 3:
+                break
+        if len(ids) == 3:
+            break
+    id_list = ", ".join(ids)
+    return (
+        f"{problem} It appears in {id_list} ({hits[0][1]!r}). "
+        f"Cite one of these segments or remove the {kind}."
+    )
 
 
 def _resolve_evidence_ids(
@@ -364,7 +560,7 @@ def _ids_from_entry(raw: str, segments: dict[str, Segment]) -> list[str]:
     if not parts:
         return []
     for part in parts:
-        token = _strip_brackets(part)
+        token = _without_clock(_strip_brackets(part))
         span = _SPAN.fullmatch(token)
         if span:
             found.extend(_expand_span(int(span.group(1)), int(span.group(2)), segments))
@@ -383,7 +579,17 @@ def _strip_brackets(text: str) -> str:
     token = text.strip()
     while token.startswith("[") and token.endswith("]") and len(token) >= 2:
         token = token[1:-1].strip()
+    # [s13] 00:24 keeps the clock outside the brackets.
+    if token.startswith("[") and "]" in token:
+        head, _, tail = token.partition("]")
+        token = f"{head[1:].strip()} {tail.strip()}".strip()
     return token
+
+
+def _without_clock(token: str) -> str:
+    """Drop a trailing clock time so ``s13 00:24`` resolves to ``s13``."""
+
+    return _CLOCK_SUFFIX.sub("", token).strip()
 
 
 def _expand_span(start: int, end: int, segments: dict[str, Segment]) -> list[str]:
@@ -396,7 +602,7 @@ def _cap_ids(ids: list[str], text: str, segments: dict[str, Segment]) -> list[st
     ordered = sorted(dict.fromkeys(ids), key=lambda sid: (segments[sid].start, sid))
     if len(ordered) <= MAX_EVIDENCE_IDS:
         return ordered
-    anchors = [sid for sid in ordered if _line_supports(text, segments[sid].text)]
+    anchors = [sid for sid in ordered if _line_supports(text, _window_text([sid], segments))]
     chosen: list[str] = []
     for sid in anchors + ordered:
         if sid in chosen:
@@ -567,24 +773,16 @@ def _missing_number_problem(
     number: str,
     evidence_ids: list[str],
     segments: dict[str, Segment],
+    allowed: set[str] | None = None,
 ) -> str:
     """Point the retry at lines that contain the number, or tell the model to drop it."""
 
     problem = f"{label} uses the number {number}, which is not in the cited transcript."
-    cited = set(evidence_ids)
-    found = [
-        segment
-        for segment in segments.values()
-        if segment.id not in cited and _number_supported(number, segment.text)
-    ]
-    if not found:
-        return f"{problem} It does not appear anywhere in the transcript. Remove the number."
-    shown = found[:3]
-    id_list = ", ".join(segment.id for segment in shown)
-    return (
-        f"{problem} It appears in {id_list} ({shown[0].text!r}). "
-        "Cite one of these segments or remove the number."
+    hits = _fresh_hits(
+        _anchor_hits(segments, lambda line: _number_supported(number, line), allowed),
+        set(evidence_ids),
     )
+    return _missing_anchor_message(problem, hits, allowed, "number")
 
 
 def _missing_name_problem(
@@ -592,26 +790,21 @@ def _missing_name_problem(
     name: str,
     evidence_ids: list[str],
     segments: dict[str, Segment],
+    allowed: set[str] | None = None,
 ) -> str:
     """Point the retry at lines that contain the name, or tell the model to drop it."""
 
     problem = f"{label} names {name!r}, which is not in the cited transcript."
     forms = _name_forms(name)
-    cited = set(evidence_ids)
-    found = [
-        segment
-        for segment in segments.values()
-        if segment.id not in cited
-        and _folded_has_name(collapse_whitespace(segment.text).casefold(), forms)
-    ]
-    if not found:
-        return f"{problem} It does not appear anywhere in the transcript. Remove the name."
-    shown = found[:3]
-    id_list = ", ".join(segment.id for segment in shown)
-    return (
-        f"{problem} It appears in {id_list} ({shown[0].text!r}). "
-        "Cite one of these segments or remove the name."
+    hits = _fresh_hits(
+        _anchor_hits(
+            segments,
+            lambda line: _folded_has_name(collapse_whitespace(line).casefold(), forms),
+            allowed,
+        ),
+        set(evidence_ids),
     )
+    return _missing_anchor_message(problem, hits, allowed, "name")
 
 
 def _names(text: str) -> list[str]:

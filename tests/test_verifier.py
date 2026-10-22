@@ -358,6 +358,82 @@ def test_word_limit_keeps_the_opening_and_closing_points() -> None:
     assert any("length limit" in item for item in kept.limitations)
 
 
+def test_wrapped_name_is_supported_by_the_first_caption() -> None:
+    source = transcript_with(
+        "Doctor Who to be more like Stranger",
+        "Things.",
+    )
+    summary = SummaryResponse(
+        main_idea=claim("Doctor Who moved toward Stranger Things.", "s1"),
+        key_points=[claim("Doctor Who moved toward Stranger Things.", "s1")],
+    )
+    assert review_summary(summary, source, EVIDENCE_PRESET) == []
+    kept = salvage(summary, source, EVIDENCE_PRESET)
+    assert kept.main_idea.evidence_ids == ["s1", "s2"]
+
+
+def test_split_name_is_found_across_the_next_caption() -> None:
+    source = transcript_with(
+        "The opening sets the scene.",
+        "It's already well known that Shooty",
+        "Gatwa was still filming.",
+    )
+    summary = SummaryResponse(
+        main_idea=claim("Shooty Gatwa was still filming.", "s1"),
+        key_points=[claim("The opening sets the scene.", "s1")],
+    )
+    problem = next(
+        item for item in review_summary(summary, source, EVIDENCE_PRESET) if "Shooty Gatwa" in item
+    )
+    assert "s2, s3" in problem
+    assert "Shooty Gatwa" in problem
+    assert "Remove the name." not in problem
+
+
+def test_a_finished_sentence_does_not_join_the_next_caption() -> None:
+    source = transcript_with("The story is about Stranger.", "Things happened later.")
+    summary = SummaryResponse(
+        main_idea=claim("The story is about Stranger Things.", "s1"),
+        key_points=[claim("The story is about Stranger.", "s1")],
+    )
+    problem = " ".join(review_summary(summary, source, EVIDENCE_PRESET))
+    assert "Stranger Things" in problem
+    assert "Remove the name." in problem
+
+
+def test_clock_time_after_an_id_still_resolves() -> None:
+    source = transcript_with(
+        "Doctor Who to be more like Stranger",
+        "Things.",
+    )
+    for evidence in ("s1 00:00", "[s1 00:00]", "s1 1:02:05", "[s1] 00:00"):
+        summary = SummaryResponse(
+            main_idea=claim("Doctor Who moved toward Stranger Things.", evidence),
+            key_points=[claim("Doctor Who moved toward Stranger Things.", "s1")],
+        )
+        assert review_summary(summary, source, EVIDENCE_PRESET) == [], evidence
+
+
+def test_wrapped_quote_matches_and_a_shortened_quote_does_not() -> None:
+    source = transcript_with(
+        'He said, "I was envious of the way',
+        'Stranger Things use fantasy."',
+    )
+    exact = 'He said, "I was envious of the way Stranger Things use fantasy."'
+    shortened = 'He said, "I was envious of the way Stranger Things."'
+    accepted = SummaryResponse(
+        main_idea=claim(exact, "s1"),
+        key_points=[claim(exact, "s1")],
+    )
+    assert review_summary(accepted, source, EVIDENCE_PRESET) == []
+    rejected = SummaryResponse(
+        main_idea=claim(shortened, "s1"),
+        key_points=[claim(exact, "s1")],
+    )
+    problem = " ".join(review_summary(rejected, source, EVIDENCE_PRESET))
+    assert "I was envious of the way Stranger Things." in problem
+
+
 def test_overlong_main_idea_is_kept_with_a_limitation() -> None:
     source = transcript_with("A short caption.")
     summary = SummaryResponse(

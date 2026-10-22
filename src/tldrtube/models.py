@@ -58,7 +58,8 @@ class Claim(BaseModel):
         max_length=MAX_EVIDENCE_IDS,
         description=(
             f"From 1 to {MAX_EVIDENCE_IDS} segment ids. "
-            "Copy the id inside the brackets of each supporting line. "
+            "Copy only the id in brackets, such as s1. "
+            "The clock time after the brackets is not an id. "
             "One id per line. A span is not an id."
         ),
     )

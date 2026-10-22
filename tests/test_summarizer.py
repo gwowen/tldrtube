@@ -210,11 +210,15 @@ def test_prompt_does_not_list_every_evidence_id() -> None:
     assert f"1 to {MAX_EVIDENCE_IDS}" in text
     assert "One id per line" in text
     assert "A span is not an id" in text
+    assert "clock time" in text
+    assert "[s1] 00:00 " in text
+    assert "[s1 00:00]" not in text
     assert '["s12", "s14"]' not in text
     evidence = Claim.model_json_schema()["properties"]["evidence_ids"]
     assert evidence["maxItems"] == MAX_EVIDENCE_IDS
     assert evidence["minItems"] == 1
     assert "One id per line" in evidence["description"]
+    assert "clock time" in evidence["description"]
     assert "s12" not in evidence["description"]
 
 
@@ -484,4 +488,74 @@ def test_progress_is_written_to_stderr(capsys) -> None:
     assert "one pass" in err
     assert "Asking test-model to summarise 1 segment." in err
     assert "Asking the model to correct it." in err
+    assert "s99" in err
+    assert "not a line id" in err
     assert "passed the evidence checks" in err
+
+
+def test_extract_repairs_a_wrapped_name_and_keeps_the_better_attempt(capsys) -> None:
+    snippets = [
+        (0.0, 1.0, "Doctor Who to be more like Stranger"),
+        (1.0, 1.0, "Things."),
+    ]
+    for index in range(2, 8):
+        snippets.append((float(index), 1.0, "word " * 400))
+    snippets.append((8.0, 1.0, "Grace Hopper rewrote the ending."))
+    for index in range(9, 20):
+        snippets.append((float(index), 1.0, "word " * 400))
+    source = build_transcript(
+        video_id=VIDEO_ID,
+        language="English",
+        language_code="en",
+        is_generated=True,
+        snippets=snippets,
+    )
+    calls = {"extract": 0}
+
+    def handler(schema, messages):
+        if schema is SummaryResponse:
+            return acceptable("s1")
+        calls["extract"] += 1
+        if calls["extract"] == 1:
+            return ExtractResponse(
+                points=[
+                    Claim(
+                        text="The show moved toward Stranger Things.",
+                        evidence_ids=["s1"],
+                    ),
+                    Claim(text="Grace Hopper rewrote the ending.", evidence_ids=["s1"]),
+                ]
+            )
+        if calls["extract"] == 2:
+            return ExtractResponse(
+                points=[Claim(text="Retention improved by 87 percent.", evidence_ids=["s1"])]
+            )
+        text = messages[-1].content
+        evidence_id = re.search(r"\[(s\d+)", text).group(1)
+        return ExtractResponse(
+            points=[
+                Claim(
+                    text="a supported point from this span",
+                    evidence_ids=[evidence_id],
+                )
+            ]
+        )
+
+    configure_logging()
+    chat = FakeChat(handler=handler)
+    summarize(source, preset=PRESETS["short"], chat_model=chat)
+    condense = user_text(chat.calls[-1])
+    candidates = condense.split("Transcript evidence:\n", 1)[0]
+    assert "The show moved toward Stranger Things. (evidence: s1, s2)" in candidates
+    assert "Grace Hopper" not in candidates
+    assert "87 percent" not in candidates
+    hopper = next(segment for segment in source.segments if "Grace Hopper" in segment.text)
+    retry = user_text(chat.calls[1])
+    assert "Grace Hopper" in retry
+    assert "does not appear in this span" in retry
+    assert hopper.id not in retry
+    err = capsys.readouterr().err
+    assert "were not accepted" in err
+    assert "Grace Hopper" in err
+    assert "87" in err
+    assert "Keeping 1 supported points" in err
