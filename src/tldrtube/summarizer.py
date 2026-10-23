@@ -60,7 +60,7 @@ If a point is not supported by the transcript, omit it.
 
 Associate every factual statement with supporting transcript passages.
 
-Copy only the id in brackets, such as s1. The clock time after the brackets is not an id. One id per line. A span is not an id. Each statement needs at least one evidence id and at most {MAX_EVIDENCE_IDS}. A name or number in a statement must appear in those lines.
+Copy only the id in brackets, such as s127. An id is the letter s followed by a number. Never drop the s. One id per line. A span is not an id. Each statement needs at least one evidence id and at most {MAX_EVIDENCE_IDS}. A name or number in a statement must appear in those lines.
 
 Prefer concise, direct language. Do not add introductory filler.
 
@@ -611,7 +611,7 @@ def _span_prompt(
     text = (
         f"Write a summary of {preset.min_words} to {preset.max_words} words "
         f"with {preset.min_points} to {preset.max_points} key points in spoken order.\n\n"
-        f"{_evidence_rule(len(allowed))}\n\n"
+        f"{_evidence_rule(allowed)}\n\n"
         f"Transcript:\n{lines}"
     )
     return text + _correction(problems)
@@ -632,7 +632,7 @@ def _extract_prompt(chunk: Chunk, allowed: Sequence[str], problems: list[str]) -
         "State each point as one complete idea, in spoken order. "
         "Prefer a few complete ideas over a list of fragments. "
         "Skip asides that do not change the argument.\n\n"
-        f"{_evidence_rule(len(allowed))}\n\n"
+        f"{_evidence_rule(allowed)}\n\n"
         f"{context_block}"
         f"Transcript:\n{lines}"
     )
@@ -688,7 +688,8 @@ def _condense_prompt(
         "If two candidate points say the same thing, keep one.\n\n"
         # Pass A prose is a hint. The lines below are the only citable evidence.
         "The candidate points are hints. They are not evidence. "
-        "Use only the transcript lines below, and cite their segment ids.\n\n"
+        "Use only the transcript lines below, and cite their segment ids.\n"
+        f"{_evidence_rule([segment.id for segment in ordered])}\n\n"
         "Candidate points:\n"
         + "\n".join(blocks)
         + gap
@@ -698,13 +699,20 @@ def _condense_prompt(
     return text + _correction(problems)
 
 
-def _evidence_rule(segment_count: int) -> str:
-    """Say how to cite lines without printing every id for the model to copy."""
+def _evidence_rule(allowed: Sequence[str]) -> str:
+    """Say how to cite lines without printing every id for the model to copy.
 
+    The example is an id from the middle of the span, so a long id such as
+    s633 looks as normal to the model as s1.
+    """
+
+    segment_count = len(allowed)
     line = "line" if segment_count == 1 else "lines"
+    example = allowed[segment_count // 2] if allowed else "s1"
     return (
         f"The transcript has {segment_count} {line}. "
-        "Copy only the id in brackets. The clock time after the brackets is not an id. "
+        f"Copy only the id in brackets, such as {example}. "
+        "An id is the letter s followed by a number. Never drop the s. "
         "One id per line. A span is not an id. "
         f"Use from 1 to {MAX_EVIDENCE_IDS} ids. "
         "An empty list is invalid."

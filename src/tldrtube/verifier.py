@@ -20,11 +20,15 @@ _TITLE_PHRASE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
 _ACRONYM = re.compile(r"\b[A-Z]{2,}\b")
 _WORD = re.compile(r"\b[A-Za-z][A-Za-z'-]*\b")
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
-# A model often writes a caption span instead of one id per line.
-_SPAN = re.compile(r"^s(\d+)\s*[-–—]\s*s?(\d+)$", re.IGNORECASE)
-_SINGLE = re.compile(r"^s(\d+)$", re.IGNORECASE)
+# A model often writes a caption span instead of one id per line. The leading
+# s is optional because a small model drops it: 633 and s633 name one line.
+_SPAN = re.compile(r"^s?\s*(\d+)\s*[-–—]\s*s?\s*(\d+)$", re.IGNORECASE)
+_SINGLE = re.compile(r"^s?\s*-?\s*(\d+)$", re.IGNORECASE)
 # A model often copies the clock time that follows the segment id.
 _CLOCK_SUFFIX = re.compile(r"\s+\[?\d{1,2}:\d{2}(?::\d{2})?\]?$")
+# A bare clock time is a pointer to the caption that starts at that second.
+_CLOCK = re.compile(r"^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$")
+_BRACKETS = "[](){}"
 
 
 class VerificationError(Exception):
@@ -561,6 +565,13 @@ def _ids_from_entry(raw: str, segments: dict[str, Segment]) -> list[str]:
         return []
     for part in parts:
         token = _without_clock(_strip_brackets(part))
+        clock = _CLOCK.fullmatch(token)
+        if clock:
+            sid = _segment_at_clock(clock, segments)
+            if sid is None:
+                return []
+            found.append(sid)
+            continue
         span = _SPAN.fullmatch(token)
         if span:
             found.extend(_expand_span(int(span.group(1)), int(span.group(2)), segments))
@@ -575,6 +586,21 @@ def _ids_from_entry(raw: str, segments: dict[str, Segment]) -> list[str]:
     return found
 
 
+def _segment_at_clock(clock: re.Match[str], segments: dict[str, Segment]) -> str | None:
+    """The caption that starts at a clock time the model wrote instead of an id.
+
+    The time is a pointer, not evidence. The cited caption is still checked.
+    When several captions start in the same second the first one is used.
+    """
+
+    hours, minutes, seconds = clock.groups()
+    total = int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)
+    matches = [segment for segment in segments.values() if int(segment.start) == total]
+    if not matches:
+        return None
+    return min(matches, key=lambda segment: (segment.start, segment.id)).id
+
+
 def _strip_brackets(text: str) -> str:
     token = text.strip()
     while token.startswith("[") and token.endswith("]") and len(token) >= 2:
@@ -583,7 +609,8 @@ def _strip_brackets(text: str) -> str:
     if token.startswith("[") and "]" in token:
         head, _, tail = token.partition("]")
         token = f"{head[1:].strip()} {tail.strip()}".strip()
-    return token
+    # Mismatched or stray brackets such as [481) or (s481] still name a line.
+    return token.strip(_BRACKETS + " ")
 
 
 def _without_clock(token: str) -> str:
@@ -627,17 +654,36 @@ def _unknown_id_problem(
     unresolved: list[str],
     segments: dict[str, Segment],
 ) -> str:
-    """Tell the retry that each evidence entry is one line id."""
+    """Tell the retry what was wrong with each entry and what a line id looks like."""
 
     shown = ", ".join(unresolved)
+    example = _example_id(segments)
     message = (
         f"{label} cites {shown}, which is not a line id. "
-        "Each evidence entry is one line id."
+        f"Each evidence entry is one line id: the letter s and a number, such as {example}."
     )
+    times = [
+        item
+        for item in unresolved
+        if _CLOCK.fullmatch(_without_clock(_strip_brackets(item)))
+    ]
+    if times:
+        message += (
+            f" {', '.join(times)} is a clock time. Cite the id in brackets before the line."
+        )
     ends = _valid_span_ends(unresolved, segments)
     if ends:
         message += f" The lines at the ends of that span are {', '.join(ends)}."
     return message
+
+
+def _example_id(segments: dict[str, Segment]) -> str:
+    """A real id from the middle of the transcript, so a long id looks normal."""
+
+    ordered = _ordered_segments(segments)
+    if not ordered:
+        return "s1"
+    return ordered[len(ordered) // 2].id
 
 
 def _valid_span_ends(raw_entries: list[str], segments: dict[str, Segment]) -> list[str]:

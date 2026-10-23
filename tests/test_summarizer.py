@@ -210,16 +210,57 @@ def test_prompt_does_not_list_every_evidence_id() -> None:
     assert f"1 to {MAX_EVIDENCE_IDS}" in text
     assert "One id per line" in text
     assert "A span is not an id" in text
-    assert "clock time" in text
-    assert "[s1] 00:00 " in text
-    assert "[s1 00:00]" not in text
+    assert "Never drop the s" in text
+    assert "such as s16" in text
+    assert "[s1] Caption line 0." in text
+    assert "00:00" not in text
     assert '["s12", "s14"]' not in text
     evidence = Claim.model_json_schema()["properties"]["evidence_ids"]
     assert evidence["maxItems"] == MAX_EVIDENCE_IDS
     assert evidence["minItems"] == 1
+    assert evidence["items"]["pattern"] == "^s[0-9]+$"
     assert "One id per line" in evidence["description"]
-    assert "clock time" in evidence["description"]
-    assert "s12" not in evidence["description"]
+    assert "Never drop the s" in evidence["description"]
+    assert "s12," not in evidence["description"]
+    assert "s1, s2" not in evidence["description"]
+
+
+def test_schema_pattern_does_not_reject_a_stray_id_form() -> None:
+    claim = Claim(text="A point.", evidence_ids=["633", "[s4]"])
+    assert claim.evidence_ids == ["633", "[s4]"]
+
+
+def test_long_transcript_with_bare_number_ids_still_summarises() -> None:
+    lines = [f"Line {index} of the story." for index in range(1, 1201)]
+    source = transcript_with(*lines)
+
+    def handler(schema, messages):
+        text = messages[-1].content
+        if schema is ExtractResponse:
+            # A small model drops the s from the id it copies.
+            number = re.search(r"\[s(\d+)\]", text.split("Transcript:\n", 1)[1]).group(1)
+            return ExtractResponse(
+                points=[Claim(text="A supported point.", evidence_ids=[f"[{number}]"])]
+            )
+        return SummaryResponse(
+            main_idea=Claim(text=filler(45), evidence_ids=["[633]", "[662]"]),
+            key_points=[
+                Claim(text=filler(5), evidence_ids=["S-482"]),
+                Claim(text=filler(5), evidence_ids=["05:00"]),
+                Claim(text=filler(5), evidence_ids=["[681)"]),
+            ],
+        )
+
+    chat = FakeChat(handler=handler)
+    summary = summarize(source, preset=PRESETS["short"], chat_model=chat)
+    assert summary.main_idea.evidence_ids == ["s633", "s662"]
+    # Segment s301 starts at 300 seconds, which is 05:00.
+    assert sorted(point.evidence_ids[0] for point in summary.key_points) == [
+        "s301",
+        "s482",
+        "s681",
+    ]
+    assert len([call for call in chat.calls if call["schema"] is SummaryResponse]) == 1
 
 
 def test_schema_retry_does_not_repeat_the_completion() -> None:

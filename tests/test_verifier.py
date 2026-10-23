@@ -443,3 +443,79 @@ def test_overlong_main_idea_is_kept_with_a_limitation() -> None:
     kept = salvage(summary, source, PRESETS["short"])
     assert kept.main_idea.text.startswith("noted")
     assert any("exceeds the length preset" in item for item in kept.limitations)
+
+
+def _numbered_source():
+    return transcript_with(*[f"Line {index} says something." for index in range(1, 13)])
+
+
+def test_bare_numbers_and_stray_punctuation_resolve_to_line_ids() -> None:
+    source = _numbered_source()
+    for evidence, expected in (
+        ("[7]", ["s7"]),
+        ("7", ["s7"]),
+        ("S-7", ["s7"]),
+        ("s 7", ["s7"]),
+        ("[7)", ["s7"]),
+        ("(s7]", ["s7"]),
+        ("[7], [9]", ["s7", "s9"]),
+        ("7-9", ["s7", "s8", "s9"]),
+    ):
+        summary = SummaryResponse(
+            main_idea=claim("Line 7 says something.", evidence),
+            key_points=[claim("Line 1 says something.", "s1")],
+        )
+        assert review_summary(summary, source, EVIDENCE_PRESET) == [], evidence
+        kept = salvage(summary, source, EVIDENCE_PRESET)
+        assert kept.main_idea.evidence_ids == expected, evidence
+
+
+def test_clock_time_alone_resolves_to_the_caption_that_starts_then() -> None:
+    source = _numbered_source()
+    # transcript_with starts line N at N - 1 seconds, so 00:04 is s5.
+    summary = SummaryResponse(
+        main_idea=claim("Line 5 says something.", "00:04"),
+        key_points=[claim("Line 1 says something.", "s1")],
+    )
+    assert review_summary(summary, source, EVIDENCE_PRESET) == []
+    assert salvage(summary, source, EVIDENCE_PRESET).main_idea.evidence_ids == ["s5"]
+
+
+def test_clock_time_with_no_caption_is_rejected_and_explained() -> None:
+    source = transcript_with("The pump starts.", "The valve opens.")
+    summary = SummaryResponse(
+        main_idea=claim("The valve opens.", "21:00"),
+        key_points=[claim("The pump starts.", "s1")],
+    )
+    problem = " ".join(review_summary(summary, source, EVIDENCE_PRESET))
+    assert "21:00" in problem
+    assert "clock time" in problem
+    assert "such as s" in problem
+    try:
+        salvage(summary, source, EVIDENCE_PRESET)
+    except VerificationError:
+        pass
+    else:
+        raise AssertionError("an id that names no line must fail closed")
+
+
+def test_bare_number_outside_the_transcript_is_still_rejected() -> None:
+    source = _numbered_source()
+    summary = SummaryResponse(
+        main_idea=claim("Line 5 says something.", "[633]"),
+        key_points=[claim("Line 1 says something.", "s1")],
+    )
+    problem = " ".join(review_summary(summary, source, EVIDENCE_PRESET))
+    assert "[633]" in problem
+    assert "one line id" in problem
+
+
+def test_lenient_ids_still_check_names_and_numbers_against_the_cited_line() -> None:
+    source = transcript_with("Ada Lovelace wrote notes.", "The city welcomed 40 visitors.")
+    summary = SummaryResponse(
+        main_idea=claim("Ada Lovelace wrote notes.", "[2]"),
+        key_points=[claim("The city welcomed 40 visitors.", "2")],
+    )
+    problem = " ".join(review_summary(summary, source, EVIDENCE_PRESET))
+    assert "Ada Lovelace" in problem
+    assert "40" not in problem
