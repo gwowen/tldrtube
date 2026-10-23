@@ -1,14 +1,16 @@
 """Command-line interface for tldrtube.
 
-The summary goes to stdout. Errors go to stderr so a successful summary can
-be piped. Exit 1 is a usage or transcript failure, 2 means the summary was
-not supported, and 3 means Ollama could not be used.
+The summary goes to stdout. --dump also writes that same text to a file.
+Errors go to stderr so a successful summary can be piped. Exit 1 is a usage,
+transcript, or title failure, 2 means the summary was not supported, and 3
+means Ollama could not be used.
 """
 
 import argparse
 import json
 import logging
 import sys
+from pathlib import Path
 
 from tldrtube.config import ConfigError, load_config
 from tldrtube.models import DEFAULT_MODEL, PRESETS, Claim, LengthPreset, SummaryResponse, Transcript
@@ -23,7 +25,9 @@ from tldrtube.transcript import (
     TranscriptError,
     caption_chars,
     fetch_transcript,
+    fetch_video_title,
     format_timestamp,
+    watch_url,
 )
 from tldrtube.verifier import VerificationError
 
@@ -78,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format",
         choices=("text", "markdown", "json"),
-        default="text",
+        default=None,
         help="output format (default: text)",
     )
     parser.add_argument(
@@ -99,6 +103,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Ollama base URL (default: OLLAMA_HOST or http://127.0.0.1:11434)",
     )
+    parser.add_argument(
+        "--dump",
+        action="store_true",
+        help=(
+            "also write the summary to {video_id}-summary.txt "
+            "(or .md / .json when --format is set)"
+        ),
+    )
     return parser
 
 
@@ -117,6 +129,7 @@ def run(argv: list[str] | None = None) -> int:
     try:
         require_installed_model(model, base_url)
         transcript = fetch_transcript(args.url, language=args.language)
+        title = fetch_video_title(transcript.video_id)
         summary = summarize(
             transcript,
             preset=choose_preset(args.length, transcript),
@@ -125,7 +138,7 @@ def run(argv: list[str] | None = None) -> int:
             temperature=settings.temperature,
         )
     except TranscriptError as exc:
-        # Missing captions are a data failure, not a reason to invent a summary.
+        # Missing captions or a missing title are a data failure, not a reason to invent a summary.
         print(f"tldrtube: {exc}", file=sys.stderr)
         return 1
     except VerificationError as exc:
@@ -135,7 +148,12 @@ def run(argv: list[str] | None = None) -> int:
     except ModelError as exc:
         print(f"tldrtube: {exc}", file=sys.stderr)
         return 3
-    sys.stdout.write(render(summary, transcript, args.format))
+    fmt = args.format or "text"
+    rendered = render(summary, transcript, fmt, title=title)
+    if args.dump:
+        path = _write_dump(transcript.video_id, fmt, rendered)
+        logger.info("Wrote %s.", path)
+    sys.stdout.write(rendered)
     return 0
 
 
@@ -152,20 +170,37 @@ def choose_preset(length: str | None, transcript: Transcript) -> LengthPreset:
     return PRESETS["medium"]
 
 
-def render(summary: SummaryResponse, transcript: Transcript, fmt: str) -> str:
+_DUMP_EXTENSION = {"text": "txt", "markdown": "md", "json": "json"}
+
+
+def render(summary: SummaryResponse, transcript: Transcript, fmt: str, *, title: str) -> str:
     """Render text, Markdown, or JSON. Timestamps are added here, not by the model."""
     if fmt == "json":
-        return json.dumps(_payload(summary, transcript), indent=2, ensure_ascii=False) + "\n"
-    return _render_text(summary, transcript, markdown=fmt == "markdown")
+        return json.dumps(_payload(summary, transcript, title), indent=2, ensure_ascii=False) + "\n"
+    return _render_text(summary, transcript, title, markdown=fmt == "markdown")
+
+
+def _write_dump(video_id: str, fmt: str, rendered: str) -> Path:
+    """Write the rendered summary in the current directory, replacing any previous file."""
+
+    path = Path(f"{video_id}-summary.{_DUMP_EXTENSION[fmt]}")
+    path.write_text(rendered, encoding="utf-8")
+    return path
 
 
 def main(argv: list[str] | None = None) -> None:
     sys.exit(run(argv))
 
 
-def _render_text(summary: SummaryResponse, transcript: Transcript, *, markdown: bool) -> str:
+def _render_text(
+    summary: SummaryResponse,
+    transcript: Transcript,
+    title: str,
+    *,
+    markdown: bool,
+) -> str:
     lines = [
-        _heading("TL;DR", markdown),
+        _heading(f"TL;DR - Title: {title} URL: {watch_url(transcript.video_id)}", markdown),
         "",
         summary.main_idea.text.strip(),
         "",
@@ -201,7 +236,7 @@ def _timestamp(claim: Claim, transcript: Transcript) -> str:
     return format_timestamp(earliest.start)
 
 
-def _payload(summary: SummaryResponse, transcript: Transcript) -> dict[str, object]:
+def _payload(summary: SummaryResponse, transcript: Transcript, title: str) -> dict[str, object]:
     def claim_payload(claim: Claim) -> dict[str, object]:
         return {
             "text": claim.text,
@@ -212,6 +247,8 @@ def _payload(summary: SummaryResponse, transcript: Transcript) -> dict[str, obje
     conclusion = None if summary.conclusion is None else claim_payload(summary.conclusion)
     return {
         "video_id": transcript.video_id,
+        "title": title,
+        "url": watch_url(transcript.video_id),
         "main_idea": claim_payload(summary.main_idea),
         "key_points": [claim_payload(point) for point in summary.key_points],
         "conclusion": conclusion,
