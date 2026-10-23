@@ -4,6 +4,8 @@ Field descriptions are part of the JSON schema sent to Ollama. They tell the
 model what each value means, so they are instructions as well as documentation.
 """
 
+from typing import Annotated
+
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_MODEL = "LiquidAI/lfm2.5-2.6b"
@@ -51,15 +53,21 @@ class Chunk(BaseModel):
     context: tuple[Segment, ...] = ()
 
 
+# The pattern goes into the JSON schema sent to Ollama so grammar-constrained
+# decoding can only write ids such as s633. It is not a validator: the verifier
+# still repairs a stray form such as 633 instead of rejecting the response.
+_SegmentId = Annotated[str, Field(json_schema_extra={"pattern": "^s[0-9]+$"})]
+
+
 class Claim(BaseModel):
     text: str = Field(description="A concise statement supported only by the transcript.")
-    evidence_ids: list[str] = Field(
+    evidence_ids: list[_SegmentId] = Field(
         min_length=1,
         max_length=MAX_EVIDENCE_IDS,
         description=(
             f"From 1 to {MAX_EVIDENCE_IDS} segment ids. "
-            "Copy only the id in brackets, such as s1. "
-            "The clock time after the brackets is not an id. "
+            "Copy only the id in brackets, such as s127. "
+            "An id is the letter s followed by a number. Never drop the s. "
             "One id per line. A span is not an id."
         ),
     )

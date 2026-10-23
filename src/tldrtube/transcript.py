@@ -142,11 +142,12 @@ def format_timestamp(start: float) -> str:
 def format_segment_line(segment: Segment) -> str:
     """One prompt line. The id in brackets is what the model may cite.
 
-    The clock time sits outside the brackets so it is not copied as part of the id.
+    The clock time is left out. Python computes every timestamp the user sees
+    from the cited segments, and a model copies a clock time as an id.
     """
 
-    marker = " [non-speech]" if segment.non_speech else ""
-    return f"[{segment.id}] {format_timestamp(segment.start)}{marker} {segment.text}"
+    marker = "[non-speech] " if segment.non_speech else ""
+    return f"[{segment.id}] {marker}{segment.text}"
 
 
 def utterance_continues(segment: Segment, following: Segment | None) -> bool:
