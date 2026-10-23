@@ -8,7 +8,7 @@ tldrtube is a command-line tool that writes a short, evidence-grounded summary o
 
 A local model, served by [Ollama](https://ollama.com/), condenses the words that were spoken. Python checks that every retained claim points at a real transcript segment.
 
-The model may condense, reorganise, and paraphrase. It must not add facts, names, statistics, or recommendations that the transcript does not support. tldrtube does not watch the video, read the title or description, or check claims against the web. Material that appears only on screen is missing from the summary.
+The model may condense, reorganise, and paraphrase. It must not add facts, names, statistics, or recommendations that the transcript does not support. The printed summary names the video and its URL. The model still only sees the transcript: the title and description are not sent to the model. tldrtube does not watch the video or check claims against the web. Material that appears only on screen is missing from the summary.
 
 This project is licensed under the MIT License. Copyright (c) 2026 Gareth Owen.
 
@@ -51,12 +51,15 @@ tldrtube URL --length detailed
 tldrtube URL --format text
 tldrtube URL --format markdown
 tldrtube URL --format json
+tldrtube URL --dump
 tldrtube URL --model MODEL_NAME
 tldrtube URL --language en
 tldrtube URL --ollama-url http://127.0.0.1:11434
 ```
 
 `--model` replaces the model named in `tldrtube_config.toml`. When `--length` is omitted, the summary is medium, or detailed when the transcript is longer than one pass (more than 12,000 caption characters). Passing `--length` chooses that preset. The default format is plain text. Progress is printed to stderr while the summary is written to stdout. `OLLAMA_HOST` is used when `--ollama-url` is omitted. If the host has no scheme, `http://` is added.
+
+`--dump` writes that same summary in the current directory. With no `--format`, the file is `{video_id}-summary.txt`. `--format markdown` writes `{video_id}-summary.md`, and `--format json` writes `{video_id}-summary.json`. The summary is still printed to stdout. An existing file with that name is overwritten, and the path is printed to stderr.
 
 | Preset | Words | Points |
 | --- | --- | --- |
@@ -65,6 +68,8 @@ tldrtube URL --ollama-url http://127.0.0.1:11434
 | detailed | 200–300 | 5–7 |
 
 Timestamps such as `[02:14]` come from the cited caption, not from the model. JSON includes the same timestamps alongside the evidence ids.
+
+The TL;DR line includes the video title and watch URL, for example `TL;DR - Title: Example URL: https://www.youtube.com/watch?v=VIDEO_ID`. In Markdown that line is bold. JSON includes `title` and `url`. The URL is always the `watch?v=` form, including when the command was given a bare id or a `youtu.be` link.
 
 ## Configuration
 
@@ -79,7 +84,7 @@ temperature = 0.8
 
 ## What a failure means
 
-- Exit code 1: the URL is invalid, captions are disabled, no transcript exists in the requested language, or `tldrtube_config.toml` cannot be used. The title and description are not sent to the model.
+- Exit code 1: the URL is invalid, captions are disabled, no transcript exists in the requested language, the video title cannot be retrieved, or `tldrtube_config.toml` cannot be used. The title and description are not sent to the model.
 - Exit code 2: the summary could not be tied to the transcript. tldrtube does not print a polished answer in that case.
 - Exit code 3: Ollama could not be reached, or the model did not return a readable summary. When the requested model is not installed, tldrtube lists the models Ollama has and points at `tldrtube_config.toml` or `ollama pull`.
 

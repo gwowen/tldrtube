@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 from youtube_transcript_api import (
     FetchedTranscript,
@@ -20,8 +21,10 @@ from tldrtube.transcript import (
     build_transcript,
     chunk_transcript,
     fetch_transcript,
+    fetch_video_title,
     format_timestamp,
     parse_video_id,
+    watch_url,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -340,3 +343,75 @@ def test_caption_longer_than_the_budget_stays_whole() -> None:
 )
 def test_format_timestamp(start: int, label: str) -> None:
     assert format_timestamp(start) == label
+
+
+class _TitleResponse:
+    def __init__(
+        self,
+        *,
+        payload: object | None = None,
+        text: str = "",
+        error: Exception | None = None,
+    ) -> None:
+        self._payload = payload
+        self.text = text
+        self._error = error
+
+    def raise_for_status(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def json(self) -> object:
+        return self._payload
+
+
+class _TitleClient:
+    def __init__(self, responses: list[_TitleResponse]) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(self, url: str, *, params: dict[str, str] | None = None) -> _TitleResponse:
+        self.calls.append((url, params))
+        return self._responses.pop(0)
+
+
+def test_watch_url_uses_the_video_id() -> None:
+    assert watch_url(VIDEO_ID) == f"https://www.youtube.com/watch?v={VIDEO_ID}"
+
+
+def test_fetch_video_title_uses_oembed() -> None:
+    client = _TitleClient([_TitleResponse(payload={"title": "  Bioware Closes  "})])
+    assert fetch_video_title(VIDEO_ID, client=client) == "Bioware Closes"
+    assert client.calls == [
+        (
+            "https://www.youtube.com/oembed",
+            {"url": f"https://www.youtube.com/watch?v={VIDEO_ID}", "format": "json"},
+        )
+    ]
+
+
+def test_fetch_video_title_falls_back_to_og_title() -> None:
+    pages = [
+        '<meta content="Bioware Closes &amp; More" property="og:title">',
+        '<meta property="og:title" content="Bioware Closes &amp; More">',
+    ]
+    for html in pages:
+        client = _TitleClient(
+            [
+                _TitleResponse(error=httpx.HTTPError("unauthorized")),
+                _TitleResponse(text=html),
+            ]
+        )
+        assert fetch_video_title(VIDEO_ID, client=client) == "Bioware Closes & More"
+        assert client.calls[1] == (f"https://www.youtube.com/watch?v={VIDEO_ID}", None)
+
+
+def test_fetch_video_title_fails_when_both_sources_fail() -> None:
+    client = _TitleClient(
+        [
+            _TitleResponse(error=httpx.HTTPError("unauthorized")),
+            _TitleResponse(error=httpx.HTTPError("unavailable")),
+        ]
+    )
+    with pytest.raises(TranscriptError, match="Could not retrieve the video title"):
+        fetch_video_title(VIDEO_ID, client=client)

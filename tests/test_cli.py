@@ -12,6 +12,7 @@ from tldrtube.transcript import SINGLE_PASS_CHAR_LIMIT, TranscriptError, build_t
 from tldrtube.verifier import VerificationError
 
 VIDEO_ID = "dQw4w9WgXcQ"
+TITLE = "Bioware Closes - Who Could Have Seen This Coming?"
 
 
 def sample_transcript():
@@ -38,23 +39,30 @@ def sample_summary() -> SummaryResponse:
     )
 
 
+def header(*, markdown: bool = False) -> str:
+    line = f"TL;DR - Title: {TITLE} URL: https://www.youtube.com/watch?v={VIDEO_ID}"
+    return f"**{line}**" if markdown else line
+
+
 def test_text_markdown_and_json_use_transcript_timestamps() -> None:
     source = sample_transcript()
     summary = sample_summary()
-    text = render(summary, source, "text")
-    assert text.startswith("TL;DR\n")
+    text = render(summary, source, "text", title=TITLE)
+    assert text.startswith(header() + "\n")
     assert "**TL;DR**" not in text
     assert "- The closing example comes later. — [02:14]" in text
     assert "- The speaker closes on the later example. — [1:02:05]" in text
     assert "Limitations" in text
 
-    markdown = render(summary, source, "markdown")
-    assert "**TL;DR**" in markdown
+    markdown = render(summary, source, "markdown", title=TITLE)
+    assert header(markdown=True) in markdown
     assert "**Key points**" in markdown
     assert "**Limitations**" in markdown
 
-    payload = json.loads(render(summary, source, "json"))
+    payload = json.loads(render(summary, source, "json", title=TITLE))
     assert payload["video_id"] == VIDEO_ID
+    assert payload["title"] == TITLE
+    assert payload["url"] == f"https://www.youtube.com/watch?v={VIDEO_ID}"
     assert payload["main_idea"]["timestamp"] == "02:14"
     assert payload["key_points"][0]["timestamp"] == "02:14"
     assert payload["key_points"][0]["evidence_ids"] == ["s2", "s1"]
@@ -63,6 +71,10 @@ def test_text_markdown_and_json_use_transcript_timestamps() -> None:
 
 def skip_model_check(monkeypatch) -> None:
     monkeypatch.setattr("tldrtube.cli.require_installed_model", lambda *args, **kwargs: None)
+
+
+def skip_title(monkeypatch) -> None:
+    monkeypatch.setattr("tldrtube.cli.fetch_video_title", lambda video_id: TITLE)
 
 
 class _TagsResponse:
@@ -79,18 +91,27 @@ class _TagsResponse:
 def test_cli_writes_the_summary_to_stdout(monkeypatch, capsys) -> None:
     source = sample_transcript()
     summary = sample_summary()
+    seen: dict[str, object] = {}
+
+    def capture(*args, **kwargs):
+        seen["kwargs"] = kwargs
+        return summary
+
     skip_model_check(monkeypatch)
+    skip_title(monkeypatch)
     monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
-    monkeypatch.setattr("tldrtube.cli.summarize", lambda *args, **kwargs: summary)
+    monkeypatch.setattr("tldrtube.cli.summarize", capture)
     assert run([f"https://youtu.be/{VIDEO_ID}", "--format", "markdown"]) == 0
     captured = capsys.readouterr()
-    assert "**TL;DR**" in captured.out
+    assert header(markdown=True) in captured.out
     assert captured.err == ""
+    assert "title" not in seen["kwargs"]
 
 
 def test_cli_exit_codes(monkeypatch, capsys) -> None:
     source = sample_transcript()
     skip_model_check(monkeypatch)
+    skip_title(monkeypatch)
 
     def fail_transcript(*args, **kwargs):
         raise TranscriptError("Captions are disabled for this video.")
@@ -141,6 +162,7 @@ def test_omitted_length_uses_detailed_only_past_one_pass(monkeypatch, capsys) ->
         return summary
 
     skip_model_check(monkeypatch)
+    skip_title(monkeypatch)
     monkeypatch.setattr("tldrtube.cli.summarize", capture)
 
     def chosen(source, argv: list[str]):
@@ -189,6 +211,7 @@ def test_config_supplies_model_and_temperature(monkeypatch, tmp_path, capsys) ->
         return summary
 
     skip_model_check(monkeypatch)
+    skip_title(monkeypatch)
     monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
     monkeypatch.setattr("tldrtube.cli.summarize", capture)
     assert run([VIDEO_ID]) == 0
@@ -258,8 +281,67 @@ def test_installed_model_still_fetches_the_transcript(monkeypatch, capsys) -> No
         return _TagsResponse({"models": [{"name": DEFAULT_MODEL}]})
 
     monkeypatch.setattr("tldrtube.cli.fetch_transcript", fetch)
+    monkeypatch.setattr("tldrtube.cli.fetch_video_title", lambda video_id: TITLE)
     monkeypatch.setattr("tldrtube.cli.summarize", lambda *args, **kwargs: sample_summary())
     monkeypatch.setattr("tldrtube.summarizer.httpx.get", tags)
     assert run([VIDEO_ID, "--model", DEFAULT_MODEL]) == 0
     assert fetched["called"] is True
     capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    ("fmt", "suffix"),
+    [("text", "txt"), ("markdown", "md"), ("json", "json")],
+)
+def test_dump_writes_the_rendered_summary(monkeypatch, tmp_path, capsys, fmt: str, suffix: str) -> None:
+    source = sample_transcript()
+    summary = sample_summary()
+    skip_model_check(monkeypatch)
+    skip_title(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
+    monkeypatch.setattr("tldrtube.cli.summarize", lambda *args, **kwargs: summary)
+    path = tmp_path / f"{VIDEO_ID}-summary.{suffix}"
+    path.write_text("old", encoding="utf-8")
+    assert run([VIDEO_ID, "--format", fmt, "--dump"]) == 0
+    captured = capsys.readouterr()
+    assert path.read_text(encoding="utf-8") == captured.out
+    assert path.name in captured.err
+
+
+def test_dump_without_format_writes_text(monkeypatch, tmp_path, capsys) -> None:
+    source = sample_transcript()
+    summary = sample_summary()
+    skip_model_check(monkeypatch)
+    skip_title(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
+    monkeypatch.setattr("tldrtube.cli.summarize", lambda *args, **kwargs: summary)
+    assert run([VIDEO_ID, "--dump"]) == 0
+    captured = capsys.readouterr()
+    path = tmp_path / f"{VIDEO_ID}-summary.txt"
+    assert path.read_text(encoding="utf-8") == captured.out
+    assert path.name in captured.err
+    assert not (tmp_path / f"{VIDEO_ID}-summary.md").exists()
+    assert not (tmp_path / f"{VIDEO_ID}-summary.json").exists()
+
+
+def test_missing_title_exits_before_summarising(monkeypatch, capsys) -> None:
+    skip_model_check(monkeypatch)
+    monkeypatch.setattr(
+        "tldrtube.cli.fetch_transcript",
+        lambda *args, **kwargs: sample_transcript(),
+    )
+
+    def fail_title(video_id: str) -> str:
+        raise TranscriptError("Could not retrieve the video title.")
+
+    def fail_summary(*args, **kwargs):
+        raise AssertionError("summarise should not run")
+
+    monkeypatch.setattr("tldrtube.cli.fetch_video_title", fail_title)
+    monkeypatch.setattr("tldrtube.cli.summarize", fail_summary)
+    assert run([VIDEO_ID]) == 1
+    captured = capsys.readouterr()
+    assert "Could not retrieve the video title." in captured.err
+    assert captured.out == ""

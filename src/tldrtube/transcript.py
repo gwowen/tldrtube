@@ -10,6 +10,7 @@ import re
 from html import unescape
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 from youtube_transcript_api import (
     AgeRestricted,
     CouldNotRetrieveTranscript,
@@ -80,7 +81,7 @@ _YOUTUBE_HOSTS = {
 
 
 class TranscriptError(Exception):
-    """A transcript could not be retrieved or contained no usable text."""
+    """A transcript or display title could not be retrieved, or the transcript had no usable text."""
 
 
 def parse_video_id(source: str) -> str:
@@ -440,6 +441,69 @@ def _chunk_ends_sentence(utterances: list[list[Segment]]) -> bool:
             if not segment.non_speech:
                 return _ends_sentence(segment.text)
     return False
+
+
+_OEMBED_URL = "https://www.youtube.com/oembed"
+_TITLE_TIMEOUT_SECONDS = 10.0
+# Attribute order varies. The title is HTML-escaped inside the content attribute.
+_OG_TITLE = re.compile(
+    r"""<meta\b(?=[^>]*\bproperty=["']og:title["'])(?=[^>]*\bcontent=["']([^"']*)["'])[^>]*>""",
+    re.IGNORECASE,
+)
+
+
+def watch_url(video_id: str) -> str:
+    """Canonical watch URL. It is shown to the user and is not sent to the model."""
+
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def fetch_video_title(video_id: str, *, client: httpx.Client | None = None) -> str:
+    """Return the video title for the summary header.
+
+    oEmbed is preferred. A watch-page og:title is the fallback when embedding
+    is disabled or oEmbed returns nothing. The title is not part of the transcript.
+    """
+
+    logger.info("Fetching the video title.")
+    http = client or httpx.Client(timeout=_TITLE_TIMEOUT_SECONDS, follow_redirects=True)
+    owns_client = client is None
+    page = watch_url(video_id)
+    try:
+        title = _title_from_oembed(http, page) or _title_from_watch_page(http, page)
+    finally:
+        if owns_client:
+            http.close()
+    if not title:
+        raise TranscriptError("Could not retrieve the video title.")
+    return title
+
+
+def _title_from_oembed(client: httpx.Client, page: str) -> str | None:
+    try:
+        response = client.get(_OEMBED_URL, params={"url": page, "format": "json"})
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    title = payload.get("title")
+    if not isinstance(title, str):
+        return None
+    return collapse_whitespace(unescape(title)) or None
+
+
+def _title_from_watch_page(client: httpx.Client, page: str) -> str | None:
+    try:
+        response = client.get(page)
+        response.raise_for_status()
+        match = _OG_TITLE.search(response.text)
+    except (httpx.HTTPError, ValueError, OSError):
+        return None
+    if match is None:
+        return None
+    return collapse_whitespace(unescape(match.group(1))) or None
 
 
 def fetch_transcript(
