@@ -11,14 +11,20 @@ import logging
 import sys
 
 from tldrtube.config import ConfigError, load_config
-from tldrtube.models import DEFAULT_MODEL, PRESETS, Claim, SummaryResponse, Transcript
+from tldrtube.models import DEFAULT_MODEL, PRESETS, Claim, LengthPreset, SummaryResponse, Transcript
 from tldrtube.summarizer import (
     ModelError,
     require_installed_model,
     resolve_base_url,
     summarize,
 )
-from tldrtube.transcript import TranscriptError, fetch_transcript, format_timestamp
+from tldrtube.transcript import (
+    SINGLE_PASS_CHAR_LIMIT,
+    TranscriptError,
+    caption_chars,
+    fetch_transcript,
+    format_timestamp,
+)
 from tldrtube.verifier import VerificationError
 
 logger = logging.getLogger("tldrtube")
@@ -63,8 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--length",
         choices=tuple(PRESETS),
-        default="medium",
-        help="summary length preset (default: medium)",
+        default=None,
+        help=(
+            "summary length preset (default: medium, "
+            "or detailed when the transcript needs more than one pass)"
+        ),
     )
     parser.add_argument(
         "--format",
@@ -110,7 +119,7 @@ def run(argv: list[str] | None = None) -> int:
         transcript = fetch_transcript(args.url, language=args.language)
         summary = summarize(
             transcript,
-            preset=PRESETS[args.length],
+            preset=choose_preset(args.length, transcript),
             model=model,
             base_url=base_url,
             temperature=settings.temperature,
@@ -128,6 +137,19 @@ def run(argv: list[str] | None = None) -> int:
         return 3
     sys.stdout.write(render(summary, transcript, args.format))
     return 0
+
+
+def choose_preset(length: str | None, transcript: Transcript) -> LengthPreset:
+    """Use an explicit preset, or detailed when the transcript needs more than one pass."""
+
+    if length is not None:
+        return PRESETS[length]
+    if caption_chars(transcript) > SINGLE_PASS_CHAR_LIMIT:
+        logger.info(
+            "The transcript is longer than one pass, so the summary length is detailed."
+        )
+        return PRESETS["detailed"]
+    return PRESETS["medium"]
 
 
 def render(summary: SummaryResponse, transcript: Transcript, fmt: str) -> str:

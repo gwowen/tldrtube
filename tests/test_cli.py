@@ -6,9 +6,9 @@ import httpx
 import pytest
 
 from tldrtube.cli import render, run
-from tldrtube.models import DEFAULT_MODEL, Claim, SummaryResponse
+from tldrtube.models import DEFAULT_MODEL, PRESETS, Claim, SummaryResponse
 from tldrtube.summarizer import ModelError
-from tldrtube.transcript import TranscriptError, build_transcript
+from tldrtube.transcript import SINGLE_PASS_CHAR_LIMIT, TranscriptError, build_transcript
 from tldrtube.verifier import VerificationError
 
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -116,6 +116,55 @@ def test_cli_exit_codes(monkeypatch, capsys) -> None:
     monkeypatch.setattr("tldrtube.cli.summarize", fail_model)
     assert run([VIDEO_ID, "--model", DEFAULT_MODEL]) == 3
     assert "Ollama" in capsys.readouterr().err
+
+
+def transcript_of_length(chars: int):
+    """Two captions whose text totals chars, so the sample summary can cite both."""
+
+    first = chars // 2
+    second = chars - first
+    return build_transcript(
+        video_id=VIDEO_ID,
+        language="English",
+        language_code="en",
+        is_generated=False,
+        snippets=[(0.0, 1.0, "a" * first), (1.0, 1.0, "b" * second)],
+    )
+
+
+def test_omitted_length_uses_detailed_only_past_one_pass(monkeypatch, capsys) -> None:
+    summary = sample_summary()
+    seen: dict[str, object] = {}
+
+    def capture(*args, **kwargs):
+        seen["preset"] = kwargs["preset"]
+        return summary
+
+    skip_model_check(monkeypatch)
+    monkeypatch.setattr("tldrtube.cli.summarize", capture)
+
+    def chosen(source, argv: list[str]):
+        monkeypatch.setattr("tldrtube.cli.fetch_transcript", lambda *args, **kwargs: source)
+        assert run(argv) == 0
+        captured = capsys.readouterr()
+        return seen["preset"], captured.err
+
+    preset, err = chosen(sample_transcript(), [VIDEO_ID])
+    assert preset == PRESETS["medium"]
+    assert "longer than one pass" not in err
+
+    preset, err = chosen(transcript_of_length(SINGLE_PASS_CHAR_LIMIT), [VIDEO_ID])
+    assert preset == PRESETS["medium"]
+    assert "longer than one pass" not in err
+
+    long = transcript_of_length(SINGLE_PASS_CHAR_LIMIT + 1)
+    preset, err = chosen(long, [VIDEO_ID])
+    assert preset == PRESETS["detailed"]
+    assert "longer than one pass" in err
+
+    preset, err = chosen(long, [VIDEO_ID, "--length", "short"])
+    assert preset == PRESETS["short"]
+    assert "longer than one pass" not in err
 
 
 def test_usage_error_exits_with_code_1() -> None:

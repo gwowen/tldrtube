@@ -56,7 +56,7 @@ tldrtube URL --language en
 tldrtube URL --ollama-url http://127.0.0.1:11434
 ```
 
-`--model` replaces the model named in `tldrtube_config.toml`. The default length is medium and the default format is plain text. Progress is printed to stderr while the summary is written to stdout. `OLLAMA_HOST` is used when `--ollama-url` is omitted. If the host has no scheme, `http://` is added.
+`--model` replaces the model named in `tldrtube_config.toml`. When `--length` is omitted, the summary is medium, or detailed when the transcript is longer than one pass (more than 12,000 caption characters). Passing `--length` chooses that preset. The default format is plain text. Progress is printed to stderr while the summary is written to stdout. `OLLAMA_HOST` is used when `--ollama-url` is omitted. If the host has no scheme, `http://` is added.
 
 | Preset | Words | Points |
 | --- | --- | --- |

@@ -18,6 +18,8 @@ If no suitable transcript can be retrieved, fail with an informative error. Do n
 
 Short transcripts are one pass. Longer transcripts are extracted chunk by chunk, then condensed. Pass B must cite the original transcript segments. Text generated in pass A is not evidence.
 
+When length is omitted, a transcript that does not fit in one pass uses the detailed preset.
+
 Ask for one corrected response when verification fails. Then drop invalid claims. If the main idea still has no valid evidence, fail closed and do not print a polished summary.
 
 Timestamps shown to the user are computed from the cited segments.

@@ -195,6 +195,12 @@ def build_transcript(
     )
 
 
+def caption_chars(transcript: Transcript) -> int:
+    """Caption characters, including non-speech cues. This is the one-pass budget."""
+
+    return sum(len(segment.text) for segment in transcript.segments)
+
+
 def chunk_transcript(transcript: Transcript) -> list[Chunk]:
     """Split a long transcript on thought boundaries without reordering it.
 
@@ -204,8 +210,7 @@ def chunk_transcript(transcript: Transcript) -> list[Chunk]:
     """
 
     segments = list(transcript.segments)
-    total = sum(len(segment.text) for segment in segments)
-    if total <= SINGLE_PASS_CHAR_LIMIT:
+    if caption_chars(transcript) <= SINGLE_PASS_CHAR_LIMIT:
         return [Chunk(id="c1", segments=tuple(segments))]
 
     packed = _pack_utterances(_group_utterances(segments))
