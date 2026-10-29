@@ -8,7 +8,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
-DEFAULT_MODEL = "LiquidAI/lfm2.5-2.6b"
+DEFAULT_MODEL = "lfm3:latest"
 DEFAULT_BASE_URL = "http://127.0.0.1:11434"
 # Token budget for a chunk extraction. The final summary uses the preset budget.
 EXTRACT_NUM_PREDICT = 500

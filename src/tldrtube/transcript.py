@@ -27,7 +27,7 @@ from tldrtube.models import Chunk, Segment, Transcript
 
 logger = logging.getLogger("tldrtube")
 
-# A 2.6B model stays more faithful on short spans than on one huge prompt.
+# A 1.7B model stays more faithful on short spans than on one huge prompt.
 # Budgets count caption characters, and a segment is never split in half.
 # Cuts prefer the end of a sentence, a pause, or a non-speech cue.
 SINGLE_PASS_CHAR_LIMIT = 12_000

@@ -1,2 +1,2 @@
-model = "LiquidAI/lfm2.5-2.6b"
+model = "lfm3:latest"
 temperature = 0.8

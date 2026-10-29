@@ -19,7 +19,7 @@ This project is licensed under the MIT License. Copyright (c) 2026 Gareth Owen.
 - The default model:
 
 ```bash
-ollama pull LiquidAI/lfm2.5-2.6b
+ollama pull lfm3:latest
 ```
 
 ## Install
@@ -76,7 +76,7 @@ The TL;DR line includes the video title and watch URL, for example `TL;DR - Titl
 tldrtube reads `tldrtube_config.toml` from the current working directory. A missing file uses the built-in defaults, so an installed command still runs from any directory. This repository includes a file with those defaults:
 
 ```toml
-model = "LiquidAI/lfm2.5-2.6b"
+model = "lfm3:latest"
 temperature = 0.8
 ```
 
