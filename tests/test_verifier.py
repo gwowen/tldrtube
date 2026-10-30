@@ -1,5 +1,6 @@
 """Evidence checks for model summaries."""
 
+from tldrtube.cli import render
 from tldrtube.models import MAX_EVIDENCE_IDS, PRESETS, Claim, LengthPreset, SummaryResponse
 from tldrtube.transcript import build_transcript
 from tldrtube.verifier import VerificationError, review_summary, salvage
@@ -519,3 +520,57 @@ def test_lenient_ids_still_check_names_and_numbers_against_the_cited_line() -> N
     problem = " ".join(review_summary(summary, source, EVIDENCE_PRESET))
     assert "Ada Lovelace" in problem
     assert "40" not in problem
+
+
+def test_title_case_heading_is_not_a_name_unless_it_occurs() -> None:
+    source = transcript_with(
+        "Paul Heyaymon was asked about the work.",
+        "The rest of the caption is ordinary.",
+    )
+    heading = SummaryResponse(
+        main_idea=claim("The rest of the caption is ordinary.", "s2"),
+        key_points=[
+            claim("Comparison To Racehorse Brought Out The Pasture Eventually", "s2"),
+        ],
+    )
+    problems = review_summary(heading, source, EVIDENCE_PRESET)
+    assert not any("names" in problem for problem in problems)
+
+    named = SummaryResponse(
+        main_idea=claim("Paul Heyaymon On Vince Work Ethic", "s2"),
+        key_points=[claim("The rest of the caption is ordinary.", "s2")],
+    )
+    name_problem = " ".join(review_summary(named, source, EVIDENCE_PRESET))
+    assert "Paul Heyaymon" in name_problem
+    assert "Cite one of these segments or remove the name." in name_problem
+
+    acronym = SummaryResponse(
+        main_idea=claim("ECW Revival Was A Mind Game Tonight", "s2"),
+        key_points=[claim("The rest of the caption is ordinary.", "s2")],
+    )
+    assert any("ECW" in problem for problem in review_summary(acronym, source, EVIDENCE_PRESET))
+
+
+def test_name_does_not_match_inside_a_longer_word() -> None:
+    source = transcript_with("The move was also massively unethical.")
+    summary = SummaryResponse(
+        main_idea=claim("The speaker discusses Ethics in the business.", "s1"),
+        key_points=[claim("The move was unethical.", "s1")],
+    )
+    problems = " ".join(review_summary(summary, source, EVIDENCE_PRESET))
+    assert "Ethics" in problems
+    assert "Remove the name." in problems
+
+
+def test_salvage_drops_citation_scratchpad_but_keeps_removal_notes() -> None:
+    source = transcript_with("The opening welcomes the audience.")
+    summary = SummaryResponse(
+        main_idea=claim("The opening welcomes the audience.", "s1"),
+        key_points=[claim("Grace Hopper finished the work.", "s1")],
+        limitations=["Paul Heyaymon name usage concerns; must cite s5."],
+    )
+    kept = salvage(summary, source, EVIDENCE_PRESET)
+    rendered = render(kept, source, "text", title="A title")
+    assert "must cite" not in rendered
+    assert "s5" not in rendered
+    assert "Removed key point" in rendered

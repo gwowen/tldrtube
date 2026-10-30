@@ -36,15 +36,23 @@ from tldrtube.verifier import (
     VerificationError,
     cite_supporting_lines,
     claim_problems,
+    is_coverage_hint,
     normalize_claim,
     normalize_summary,
     order_key_points,
     pin_continuations,
     review_summary,
     salvage,
+    word_count,
 )
 
 logger = logging.getLogger("tldrtube")
+
+# Ollama uses 4096 tokens unless num_ctx is set. A one-pass prompt can fill that
+# window and stop the summary JSON mid-object. Characters divided by 3 overestimates
+# tokens, and the margin leaves room for the correction on a retry.
+_CONTEXT_MARGIN = 256
+_MAX_CONTEXT = 32_768
 
 # Shared rules for every call. The last paragraph treats caption text as data
 # so an instruction inside the video cannot redirect the summary.
@@ -281,27 +289,20 @@ def _summarize_span(
     chat_model: object | None,
     temperature: float,
 ) -> SummaryResponse:
-    runnable = _bind(
-        SummaryResponse,
-        preset.num_predict,
-        model,
-        base_url,
-        chat_model,
-        temperature,
-    )
     allowed = [segment.id for segment in segments]
 
     def user_text(problems: list[str]) -> str:
         return _span_prompt(segments, allowed, preset, problems)
 
     return _generate(
-        runnable,
         _FINAL_SYSTEM,
         user_text,
         transcript,
         preset,
         model=model,
         base_url=base_url,
+        chat_model=chat_model,
+        temperature=temperature,
         activity=f"Asking {model} to summarise {len(segments)} {_plural(len(segments), 'segment')}.",
     )
 
@@ -350,26 +351,18 @@ def _summarize_long(
             "spans did not yield supported points."
         )
 
-    runnable = _bind(
-        SummaryResponse,
-        preset.num_predict,
-        model,
-        base_url,
-        chat_model,
-        temperature,
-    )
-
     def user_text(problems: list[str]) -> str:
         return _condense_prompt(candidates, empty_spans, transcript, preset, problems)
 
     summary = _generate(
-        runnable,
         _FINAL_SYSTEM,
         user_text,
         transcript,
         preset,
         model=model,
         base_url=base_url,
+        chat_model=chat_model,
+        temperature=temperature,
         activity=f"Asking {model} to condense {len(candidates)} {_plural(len(candidates), 'candidate point')}.",
     )
     if empty_spans:
@@ -394,20 +387,13 @@ def _extract_chunk(
 ) -> list[Claim] | None:
     """Extract one chunk. Retry once, then keep the supported points.
 
-    Returns None when both attempts are unreadable. A point that cites only the
+    Returns None when both attempts are unreadable. An empty list on the first
+    attempt is retried when the span contains speech. A later empty or thinner
+    list does not replace points already salvaged. A point that cites only the
     lookback is dropped. Repair may add a line from this span or its lookback,
-    including the next caption when a wrapped name needs it. The attempt with
-    more supported points is kept.
+    including the next caption when a wrapped name needs it.
     """
 
-    runnable = _bind(
-        ExtractResponse,
-        EXTRACT_NUM_PREDICT,
-        model,
-        base_url,
-        chat_model,
-        temperature,
-    )
     segments = {segment.id: segment for segment in transcript.segments}
     context_ids = {segment.id for segment in chunk.context}
     allowed = [segment.id for segment in (*chunk.context, *chunk.segments)]
@@ -421,11 +407,21 @@ def _extract_chunk(
             _log_problems(problems)
         else:
             logger.info("Extracting key points from %s.", label)
+        user = _extract_prompt(chunk, allowed, problems)
+        runnable = _bind(
+            ExtractResponse,
+            EXTRACT_NUM_PREDICT,
+            model,
+            base_url,
+            chat_model,
+            temperature,
+            _num_ctx(len(_EXTRACT_SYSTEM) + len(user), EXTRACT_NUM_PREDICT),
+        )
         try:
             value = _invoke(
                 runnable,
                 _EXTRACT_SYSTEM,
-                _extract_prompt(chunk, allowed, problems),
+                user,
                 model=model,
                 base_url=base_url,
             )
@@ -434,7 +430,8 @@ def _extract_chunk(
                 pin_continuations(normalize_claim(point, segments), segments, allowed_ids)
                 for point in parsed.points
             ]
-        except _UnusableResponse:
+        except _UnusableResponse as exc:
+            logger.info("The model response could not be parsed: %s", _short_parse_reason(exc))
             problems = [_schema_problem()]
             continue
         problems = []
@@ -452,9 +449,16 @@ def _extract_chunk(
                     f"Candidate point {point_index} cites only the already covered context. "
                     "Cite at least one segment id from this span, or omit the point."
                 )
+        if not points and attempt == 0 and _span_has_speech(chunk):
+            problems = [_empty_extract_problem()]
+            kept_attempts.append([])
+            continue
         if not problems:
-            logger.info("Supported points from %s: %s.", label, len(points))
-            return points
+            best_kept = max((len(item) for item in kept_attempts), default=0)
+            if len(points) >= best_kept:
+                logger.info("Supported points from %s: %s.", label, len(points))
+                return points
+            break
         kept_attempts.append(
             _supported_points(points, segments, context_ids, allowed_ids)
         )
@@ -500,7 +504,6 @@ def _log_problems(problems: list[str]) -> None:
 
 
 def _generate(
-    runnable: object,
     system: str,
     user_text,
     transcript: Transcript,
@@ -508,36 +511,93 @@ def _generate(
     *,
     model: str,
     base_url: str,
+    chat_model: object | None,
+    temperature: float,
     activity: str,
 ) -> SummaryResponse:
-    """Ask once, then at most once more. Salvage the last readable response."""
+    """Ask once, then at most once more. Keep the richer supported draft.
+
+    A word or point shortfall does not trigger the retry. When a retry does
+    happen, each readable draft is salvaged and the one with more supported
+    key points, then more words, is kept.
+    """
 
     problems: list[str] = []
     parsed: SummaryResponse | None = None
+    readable: list[SummaryResponse] = []
     for attempt in range(2):
         if attempt:
             logger.info("The response was not accepted. Asking the model to correct it.")
             _log_problems(problems)
         else:
             logger.info(activity)
+        user = user_text(problems)
+        # Rebind so the correction, which lengthens the prompt, keeps its own output budget.
+        runnable = _bind(
+            SummaryResponse,
+            preset.num_predict,
+            model,
+            base_url,
+            chat_model,
+            temperature,
+            _num_ctx(len(system) + len(user), preset.num_predict),
+        )
         try:
-            value = _invoke(runnable, system, user_text(problems), model=model, base_url=base_url)
+            value = _invoke(runnable, system, user, model=model, base_url=base_url)
             parsed = normalize_summary(_coerce(SummaryResponse, value), transcript)
-        except _UnusableResponse:
+        except _UnusableResponse as exc:
+            logger.info("The model response could not be parsed: %s", _short_parse_reason(exc))
             problems = [_schema_problem()]
             continue
+        readable.append(parsed)
         problems = review_summary(parsed, transcript, preset)
-        if not problems:
+        if not any(not is_coverage_hint(problem) for problem in problems):
             logger.info("The summary passed the evidence checks.")
-            return order_key_points(parsed, transcript)
-    if parsed is None:
+            if len(readable) == 1:
+                return order_key_points(parsed, transcript)
+            logger.info("Removing claims that are not supported by the transcript.")
+            return _prefer_salvage(readable, transcript, preset)
+    if not readable:
         _log_problems(problems)
         raise ModelError(
             "The model returned a response that could not be read as the expected summary."
         )
     _log_problems(problems)
     logger.info("Removing claims that are not supported by the transcript.")
-    return salvage(parsed, transcript, preset)
+    return _prefer_salvage(readable, transcript, preset)
+
+
+def _prefer_salvage(
+    candidates: Sequence[SummaryResponse],
+    transcript: Transcript,
+    preset: LengthPreset,
+) -> SummaryResponse:
+    """Keep the salvaged draft with more key points, then more words."""
+
+    salvaged: list[SummaryResponse] = []
+    error: VerificationError | None = None
+    for candidate in candidates:
+        try:
+            salvaged.append(salvage(candidate, transcript, preset))
+        except VerificationError as exc:
+            error = exc
+    if not salvaged:
+        raise error if error is not None else VerificationError(
+            "A faithful summary could not be produced."
+        )
+    best = salvaged[0]
+    for item in salvaged[1:]:
+        rank = (len(item.key_points), word_count(item))
+        if rank > (len(best.key_points), word_count(best)):
+            best = item
+    return best
+
+
+def _num_ctx(prompt_chars: int, num_predict: int) -> int:
+    """Context large enough for this prompt and its generation budget."""
+
+    needed = prompt_chars // 3 + num_predict + _CONTEXT_MARGIN
+    return min(_MAX_CONTEXT, needed)
 
 
 def _bind(
@@ -547,18 +607,28 @@ def _bind(
     base_url: str,
     chat_model: object | None,
     temperature: float,
+    num_ctx: int,
 ) -> object:
-    """Bind the schema with Ollama's native JSON schema, not its tool API."""
+    """Bind the schema with Ollama's native JSON schema, not its tool API.
+
+    An injected client is left unchanged. Production sets num_ctx on ChatOllama.
+    """
 
     client = (
         chat_model
         if chat_model is not None
-        else _chat_model(model, base_url, num_predict, temperature)
+        else _chat_model(model, base_url, num_predict, temperature, num_ctx)
     )
     return client.with_structured_output(schema, method="json_schema")
 
 
-def _chat_model(model: str, base_url: str, num_predict: int, temperature: float) -> ChatOllama:
+def _chat_model(
+    model: str,
+    base_url: str,
+    num_predict: int,
+    temperature: float,
+    num_ctx: int,
+) -> ChatOllama:
     # Temperature comes from tldrtube_config.toml and defaults to Ollama's 0.8.
     # reasoning is off so this agentic checkpoint spends the token budget on the summary.
     return ChatOllama(
@@ -566,8 +636,33 @@ def _chat_model(model: str, base_url: str, num_predict: int, temperature: float)
         base_url=base_url,
         temperature=temperature,
         num_predict=num_predict,
+        num_ctx=num_ctx,
         reasoning=False,
     )
+
+
+def _short_parse_reason(exc: BaseException) -> str:
+    """One line for the log. The completion can be a long id list and is left out."""
+
+    text = str(exc).strip()
+    if text.startswith("Invalid json output:") or "JSONDecodeError" in text:
+        return "the output was cut off before the JSON finished."
+    detail = text.split("Got: ", 1)[-1]
+    lines: list[str] = []
+    for raw in detail.splitlines():
+        line = raw.strip()
+        if not line or "validation error" in line or "from completion" in line:
+            continue
+        message = line.split(" [type=", 1)[0]
+        message = message.split("input_value=", 1)[0].strip().rstrip(",")
+        if message:
+            lines.append(message)
+    if not lines:
+        return "the output did not match the summary schema."
+    reason = "; ".join(lines[:4])
+    if len(reason) > 200:
+        return reason[:197].rstrip() + "..."
+    return reason
 
 
 def _coerce(schema: type[BaseModel], value: object) -> BaseModel:
@@ -630,6 +725,7 @@ def _extract_prompt(chunk: Chunk, allowed: Sequence[str], problems: list[str]) -
     text = (
         f"Span {chunk.id}. List the candidate points that are new in this span. "
         "State each point as one complete idea, in spoken order. "
+        "Write each point as an ordinary sentence. Do not capitalise every word. "
         "Prefer a few complete ideas over a list of fragments. "
         "Skip asides that do not change the argument.\n\n"
         f"{_evidence_rule(allowed)}\n\n"
@@ -637,6 +733,18 @@ def _extract_prompt(chunk: Chunk, allowed: Sequence[str], problems: list[str]) -
         f"Transcript:\n{lines}"
     )
     return text + _correction(problems)
+
+
+def _span_has_speech(chunk: Chunk) -> bool:
+    return any(not segment.non_speech and segment.text.strip() for segment in chunk.segments)
+
+
+def _empty_extract_problem() -> str:
+    return (
+        "This span contains speech but the point list was empty. "
+        "Return the distinct claims, stories, or arguments in this span. "
+        "Use an empty list only when the span adds nothing beyond the already covered context."
+    )
 
 
 def _context_only(point: Claim, context_ids: set[str]) -> bool:

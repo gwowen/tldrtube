@@ -1,5 +1,6 @@
 """Summariser passes, retries, and fail-closed behaviour."""
 
+import logging
 import re
 
 import httpx
@@ -9,7 +10,16 @@ from ollama import ResponseError
 
 from tldrtube.cli import configure_logging
 from tldrtube.models import MAX_EVIDENCE_IDS, PRESETS, Claim, ExtractResponse, SummaryResponse
-from tldrtube.summarizer import ModelError, require_installed_model, resolve_base_url, summarize
+from tldrtube.summarizer import (
+    _MAX_CONTEXT,
+    _num_ctx,
+    _short_parse_reason,
+    logger,
+    ModelError,
+    require_installed_model,
+    resolve_base_url,
+    summarize,
+)
 from tldrtube.transcript import build_transcript
 from tldrtube.verifier import VerificationError
 
@@ -75,6 +85,7 @@ def test_configured_temperature_is_sent_to_ollama(monkeypatch) -> None:
             return self
 
         def invoke(self, messages):
+            captured["messages"] = messages
             return acceptable()
 
     monkeypatch.setattr("tldrtube.summarizer.ChatOllama", FakeOllama)
@@ -91,6 +102,111 @@ def test_configured_temperature_is_sent_to_ollama(monkeypatch) -> None:
     assert captured["temperature"] == 0.2
     assert captured["reasoning"] is False
     assert isinstance(captured["num_predict"], int)
+    prompt_chars = sum(len(message.content) for message in captured["messages"])
+    assert captured["num_ctx"] >= prompt_chars // 3 + captured["num_predict"]
+    assert captured["num_ctx"] <= _MAX_CONTEXT
+
+
+def test_context_window_covers_a_one_pass_prompt() -> None:
+    predict = PRESETS["medium"].num_predict
+    ctx = _num_ctx(15_000, predict)
+    assert ctx > 4096
+    assert ctx >= 15_000 // 3 + predict
+    assert _num_ctx(1_000_000, 1100) == _MAX_CONTEXT
+
+
+def test_retry_sizes_context_to_the_longer_prompt(monkeypatch) -> None:
+    contexts: list[int] = []
+
+    class FakeOllama:
+        def __init__(self, **kwargs) -> None:
+            contexts.append(kwargs["num_ctx"])
+
+        def with_structured_output(self, schema, method="json_schema"):
+            assert method == "json_schema"
+            return self
+
+        def invoke(self, messages):
+            if len(contexts) == 1:
+                raise OutputParserException("Invalid json output: {")
+            return acceptable()
+
+    monkeypatch.setattr("tldrtube.summarizer.ChatOllama", FakeOllama)
+    summarize(
+        transcript_with("The lecture shows how a hash table stores keys."),
+        preset=PRESETS["short"],
+    )
+    assert len(contexts) == 2
+    assert contexts[1] > contexts[0]
+
+
+def test_short_parse_reason_drops_the_completion() -> None:
+    dump = "s1, " * 40
+    cut_off = _short_parse_reason(OutputParserException(f"Invalid json output: {dump}"))
+    assert "cut off" in cut_off
+    assert dump not in cut_off
+    reason = _short_parse_reason(
+        OutputParserException(
+            "Failed to parse SummaryResponse from completion "
+            + dump
+            + ". Got: 1 validation error for SummaryResponse\n"
+            "evidence_ids\n"
+            "  List should have at most 8 items after validation, not 40 "
+            "[type=too_long, input_value=['s1'], input_type=list]"
+        )
+    )
+    assert dump not in reason
+    assert "evidence_ids" in reason
+    assert "at most 8" in reason
+    assert "input_value" not in reason
+    long_message = "List should have at most 8 items " + ("x" * 300)
+    long_reason = _short_parse_reason(
+        OutputParserException(
+            "Failed to parse. Got: 1 validation error for SummaryResponse\n"
+            "evidence_ids\n"
+            f"  {long_message} [type=too_long, input_value=['s1'], input_type=list]"
+        )
+    )
+    assert "evidence_ids" in long_reason
+    assert "at most 8" in long_reason
+    assert len(long_reason) <= 200
+    assert "input_value" not in long_reason
+
+
+def test_parse_failure_logs_a_short_reason() -> None:
+    dump = "s1, " * 40
+    records: list[str] = []
+
+    class Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = Handler()
+    handler.setLevel(logging.INFO)
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    chat = FakeChat(
+        [
+            OutputParserException(f"Invalid json output: {dump}"),
+            acceptable(),
+        ]
+    )
+    try:
+        summarize(
+            transcript_with("The lecture shows how a hash table stores keys."),
+            preset=PRESETS["short"],
+            chat_model=chat,
+        )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    logged = "\n".join(records)
+    assert dump not in logged
+    assert "cut off" in logged
+    correction = user_text(chat.calls[1])
+    assert dump not in correction
+    assert "required schema" in correction
 
 
 def test_short_transcript_uses_one_summary_call() -> None:
@@ -228,6 +344,13 @@ def test_prompt_does_not_list_every_evidence_id() -> None:
 def test_schema_pattern_does_not_reject_a_stray_id_form() -> None:
     claim = Claim(text="A point.", evidence_ids=["633", "[s4]"])
     assert claim.evidence_ids == ["633", "[s4]"]
+
+
+def test_overlong_evidence_list_keeps_the_first_eight_ids() -> None:
+    raw = [f"s{index}" for index in range(1, 15)]
+    parsed = Claim.model_validate({"text": "A point.", "evidence_ids": raw})
+    assert parsed.evidence_ids == raw[:MAX_EVIDENCE_IDS]
+    assert Claim.model_json_schema()["properties"]["evidence_ids"]["maxItems"] == MAX_EVIDENCE_IDS
 
 
 def test_long_transcript_with_bare_number_ids_still_summarises() -> None:
@@ -600,3 +723,130 @@ def test_extract_repairs_a_wrapped_name_and_keeps_the_better_attempt(capsys) -> 
     assert "Grace Hopper" in err
     assert "87" in err
     assert "Keeping 1 supported points" in err
+
+
+def test_empty_speech_extract_is_retried_and_later_empty_keeps_salvage() -> None:
+    snippets = [
+        (float(index * 10), 5.0, f"span-{index} " + ("word " * 1000))
+        for index in range(3)
+    ]
+    source = build_transcript(
+        video_id=VIDEO_ID,
+        language="English",
+        language_code="en",
+        is_generated=True,
+        snippets=snippets,
+    )
+
+    visits = {"c1": 0}
+
+    def handler(schema, messages):
+        if schema is SummaryResponse:
+            return acceptable("s1")
+        text = messages[-1].content
+        span = re.search(r"Span (c\d+)", text).group(1)
+        transcript_text = text.split("Transcript:\n", 1)[1]
+        evidence_id = re.search(r"\[(s\d+)", transcript_text).group(1)
+        point = Claim(
+            text="a supported point from this span",
+            evidence_ids=[evidence_id],
+        )
+        if span == "c1":
+            visits["c1"] += 1
+            if visits["c1"] > 1:
+                return ExtractResponse(points=[])
+            return ExtractResponse(
+                points=[
+                    point,
+                    Claim(text="Grace Hopper rewrote the ending.", evidence_ids=[evidence_id]),
+                ]
+            )
+        if span == "c2":
+            if "point list was empty" not in text:
+                return ExtractResponse(points=[])
+            return ExtractResponse(points=[point])
+        return ExtractResponse(points=[point])
+
+    chat = FakeChat(handler=handler)
+    summarize(source, preset=PRESETS["short"], chat_model=chat)
+    extracts = [call for call in chat.calls if call["schema"] is ExtractResponse]
+    assert len(extracts) == 5
+    assert "ordinary sentence" in user_text(extracts[0])
+    c2_prompts = [user_text(call) for call in extracts if "Span c2" in user_text(call)]
+    assert len(c2_prompts) == 2
+    assert "point list was empty" in c2_prompts[1]
+    condense = user_text(chat.calls[-1])
+    candidates = condense.split("Transcript evidence:\n", 1)[0]
+    assert candidates.count("a supported point from this span") == 3
+    assert "Grace Hopper" not in candidates
+
+
+def test_word_shortfall_alone_does_not_retry() -> None:
+    source = transcript_with("The lecture shows how a hash table stores keys.")
+    short = SummaryResponse(
+        main_idea=Claim(
+            text="The lecture shows how a hash table stores keys.",
+            evidence_ids=["s1"],
+        ),
+        key_points=[Claim(text="The lecture shows the keys.", evidence_ids=["s1"])],
+    )
+    chat = FakeChat([short])
+    summary = summarize(source, preset=PRESETS["detailed"], chat_model=chat)
+    assert len(chat.calls) == 1
+    assert summary.key_points[0].text == "The lecture shows the keys."
+
+
+def test_richer_salvaged_draft_is_kept_when_the_retry_drops_points() -> None:
+    source = transcript_with(
+        "The opening welcomes the audience.",
+        "Ada Lovelace described the engine.",
+    )
+    first = SummaryResponse(
+        main_idea=Claim(text="The opening welcomes the audience.", evidence_ids=["s1"]),
+        key_points=[
+            Claim(text="Ada Lovelace described the engine.", evidence_ids=["s1"]),
+            Claim(text="Grace Hopper finished the work.", evidence_ids=["s1"]),
+        ],
+    )
+    second = SummaryResponse(
+        main_idea=Claim(text="The opening welcomes the audience.", evidence_ids=["s1"]),
+        key_points=[
+            Claim(text="Grace Hopper finished the work.", evidence_ids=["s1"]),
+            Claim(text="NASA adopted the design.", evidence_ids=["s1"]),
+        ],
+    )
+    chat = FakeChat([first, second])
+    summary = summarize(source, preset=PRESETS["short"], chat_model=chat)
+    assert len(chat.calls) == 2
+    correction = user_text(chat.calls[1])
+    assert "do not invent points to fill the list" in correction
+    assert [point.text for point in summary.key_points] == [
+        "Ada Lovelace described the engine."
+    ]
+    assert "s2" in summary.key_points[0].evidence_ids
+
+
+def test_thinner_passing_retry_does_not_replace_a_richer_salvage() -> None:
+    source = transcript_with(
+        "The opening welcomes the audience.",
+        "Ada Lovelace described the engine.",
+    )
+    first = SummaryResponse(
+        main_idea=Claim(text="The opening welcomes the audience.", evidence_ids=["s1"]),
+        key_points=[
+            Claim(text="Ada Lovelace described the engine.", evidence_ids=["s1"]),
+            Claim(text="The opening welcomes the audience again.", evidence_ids=["s1"]),
+            Claim(text="Grace Hopper finished the work.", evidence_ids=["s1"]),
+        ],
+    )
+    second = SummaryResponse(
+        main_idea=Claim(text=filler(45), evidence_ids=["s1"]),
+        key_points=[Claim(text=filler(5), evidence_ids=["s1"])],
+    )
+    chat = FakeChat([first, second])
+    summary = summarize(source, preset=PRESETS["short"], chat_model=chat)
+    assert len(chat.calls) == 2
+    assert [point.text for point in summary.key_points] == [
+        "Ada Lovelace described the engine.",
+        "The opening welcomes the audience again.",
+    ]
