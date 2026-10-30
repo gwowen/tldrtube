@@ -29,6 +29,8 @@ _CLOCK_SUFFIX = re.compile(r"\s+\[?\d{1,2}:\d{2}(?::\d{2})?\]?$")
 # A bare clock time is a pointer to the caption that starts at that second.
 _CLOCK = re.compile(r"^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$")
 _BRACKETS = "[](){}"
+# Model limitations sometimes repeat the retry instructions. Those are not for the reader.
+_SCRATCHPAD = re.compile(r"\bs\d+\b|\bcite\b|\bschema\b", re.IGNORECASE)
 
 
 class VerificationError(Exception):
@@ -48,16 +50,29 @@ def point_count(summary: SummaryResponse) -> int:
     return len(summary.key_points) + (1 if summary.conclusion is not None else 0)
 
 
+def is_coverage_hint(problem: str) -> bool:
+    """True when the summary is merely shorter than the preset.
+
+    A shortfall is included so a retry that is already fixing evidence can see
+    it. It does not by itself reject the summary or demand another generation.
+    """
+
+    return (
+        "below the target of" in problem
+        or "do not invent points to fill the list" in problem
+    )
+
+
 def review_summary(
     summary: SummaryResponse,
     transcript: Transcript,
     preset: LengthPreset,
 ) -> list[str]:
-    """Return problems that should be sent back for one corrected generation.
+    """Return evidence problems and coverage hints for one summary.
 
-    Being under the word or point target is a hint for that retry. A short
-    transcript may genuinely have fewer points, so a shortfall does not by
-    itself reject the summary.
+    Being under the word or point target is a hint. A short transcript may
+    genuinely have fewer points, so a shortfall does not by itself reject the
+    summary. Exceeding a limit is a problem, because the preset is a ceiling.
     """
 
     segments = _index(transcript)
@@ -276,7 +291,7 @@ def pin_continuations(
     resolved, unresolved = _resolve_evidence_ids(claim.evidence_ids, claim.text, segments)
     if unresolved or not resolved:
         return claim
-    if _anchors_supported(claim.text, _join_ids(resolved, segments)):
+    if _anchors_supported(claim.text, _join_ids(resolved, segments), segments):
         if resolved == [item.strip() for item in claim.evidence_ids]:
             return claim
         return claim.model_copy(update={"evidence_ids": resolved})
@@ -290,9 +305,9 @@ def pin_continuations(
         if len(extended) >= MAX_EVIDENCE_IDS:
             break
         extended.append(nxt)
-        if _anchors_supported(claim.text, _join_ids(extended, segments)):
+        if _anchors_supported(claim.text, _join_ids(extended, segments), segments):
             break
-    if not _anchors_supported(claim.text, _join_ids(extended, segments)):
+    if not _anchors_supported(claim.text, _join_ids(extended, segments), segments):
         return claim
     ordered = sorted(dict.fromkeys(extended), key=lambda sid: (segments[sid].start, sid))
     return claim.model_copy(update={"evidence_ids": ordered})
@@ -340,7 +355,7 @@ def _lines_for_missing_anchors(
         )
         if not add_first(hits):
             return None
-    for name in _names(text):
+    for name in _required_names(text, segments):
         forms = _name_forms(name)
         if _folded_has_name(folded, forms):
             continue
@@ -394,7 +409,7 @@ def claim_problems(
             problems.append(
                 _missing_number_problem(label, number, evidence_ids, segments, allowed)
             )
-    for name in _names(claim.text):
+    for name in _required_names(claim.text, segments):
         if not _folded_has_name(folded_evidence, _name_forms(name)):
             problems.append(
                 _missing_name_problem(label, name, evidence_ids, segments, allowed)
@@ -455,7 +470,11 @@ def _window_text(evidence_ids: list[str], segments: dict[str, Segment]) -> str:
     return _join_ids(_window_ids(evidence_ids, segments), segments)
 
 
-def _anchors_supported(text: str, evidence: str) -> bool:
+def _anchors_supported(
+    text: str,
+    evidence: str,
+    segments: dict[str, Segment],
+) -> bool:
     folded = collapse_whitespace(evidence).casefold()
     for quote in _quotes(text):
         if collapse_whitespace(quote).casefold() not in folded:
@@ -463,7 +482,7 @@ def _anchors_supported(text: str, evidence: str) -> bool:
     for number in _numbers(text):
         if not _number_supported(number, evidence):
             return False
-    for name in _names(text):
+    for name in _required_names(text, segments):
         if not _folded_has_name(folded, _name_forms(name)):
             return False
     return True
@@ -629,7 +648,9 @@ def _cap_ids(ids: list[str], text: str, segments: dict[str, Segment]) -> list[st
     ordered = sorted(dict.fromkeys(ids), key=lambda sid: (segments[sid].start, sid))
     if len(ordered) <= MAX_EVIDENCE_IDS:
         return ordered
-    anchors = [sid for sid in ordered if _line_supports(text, _window_text([sid], segments))]
+    anchors = [
+        sid for sid in ordered if _line_supports(text, _window_text([sid], segments), segments)
+    ]
     chosen: list[str] = []
     for sid in anchors + ordered:
         if sid in chosen:
@@ -640,13 +661,14 @@ def _cap_ids(ids: list[str], text: str, segments: dict[str, Segment]) -> list[st
     return sorted(chosen, key=lambda sid: (segments[sid].start, sid))
 
 
-def _line_supports(text: str, line: str) -> bool:
+def _line_supports(text: str, line: str, segments: dict[str, Segment]) -> bool:
     folded_line = collapse_whitespace(line).casefold()
     if any(collapse_whitespace(quote).casefold() in folded_line for quote in _quotes(text)):
         return True
     if any(_number_supported(number, line) for number in _numbers(text)):
         return True
-    return any(_folded_has_name(folded_line, _name_forms(name)) for name in _names(text))
+    names = _required_names(text, segments)
+    return any(_folded_has_name(folded_line, _name_forms(name)) for name in names)
 
 
 def _unknown_id_problem(
@@ -811,7 +833,15 @@ def _name_forms(name: str) -> set[str]:
 
 
 def _folded_has_name(folded: str, forms: set[str]) -> bool:
-    return any(form in folded for form in forms)
+    """True when a name form is its own word, not a stem inside a longer word.
+
+    Plural forms are separate entries, so Carter still matches Carters. Ethics
+    does not match unethical.
+    """
+
+    return any(
+        re.search(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", folded) for form in forms
+    )
 
 
 def _missing_number_problem(
@@ -851,6 +881,67 @@ def _missing_name_problem(
         set(evidence_ids),
     )
     return _missing_anchor_message(problem, hits, allowed, "name")
+
+
+def _is_title_case(text: str) -> bool:
+    """True when the claim is a heading with most words capitalised."""
+
+    words = [word for word in _WORD.findall(text) if len(word) > 3]
+    if len(words) < 4:
+        return False
+    capped = sum(1 for word in words if word[:1].isupper() and word[1:].islower())
+    return capped / len(words) >= 0.75
+
+
+def _transcript_folded(segments: dict[str, Segment]) -> str:
+    ordered = _ordered_segments(segments)
+    return collapse_whitespace(" ".join(segment.text for segment in ordered)).casefold()
+
+
+def _occurring_name_parts(phrase: str, folded: str) -> list[str]:
+    """Shorter capitalised phrases inside a heading that do occur in the transcript."""
+
+    words = phrase.split()
+    found: list[str] = []
+    for length in (3, 2):
+        if len(words) < length:
+            continue
+        for start in range(len(words) - length + 1):
+            part = " ".join(words[start : start + length])
+            if any(part in longer for longer in found):
+                continue
+            if _folded_has_name(folded, _name_forms(part)):
+                found.append(part)
+    return found
+
+
+def _required_names(text: str, segments: dict[str, Segment]) -> list[str]:
+    """Names a claim must cite.
+
+    A title-case heading is not a person. A capitalised phrase in one is
+    required only when that phrase occurs in the transcript, so Paul Heyaymon
+    still has to be cited and a made-up heading does not wipe the point.
+    Acronyms stay required. Single capitalised words in a heading do not.
+    """
+
+    names = _names(text)
+    if not _is_title_case(text):
+        return names
+    folded = _transcript_folded(segments)
+    required: list[str] = []
+    for name in names:
+        if _ACRONYM.fullmatch(name):
+            required.append(name)
+            continue
+        if " " not in name:
+            continue
+        if _folded_has_name(folded, _name_forms(name)):
+            required.append(name)
+            continue
+        for part in _occurring_name_parts(name, folded):
+            if part not in required:
+                required.append(part)
+    return required
 
 
 def _names(text: str) -> list[str]:
@@ -921,7 +1012,18 @@ def _trim_to_limits(
 
 
 def _clean_limitations(items: list[str]) -> list[str]:
-    return [item.strip() for item in items if item and item.strip()]
+    """Drop blank notes and citation scratchpad the model copied into limitations.
+
+    Verifier notes are added after this, so a removal or length note still shows.
+    """
+
+    cleaned: list[str] = []
+    for item in items:
+        text = item.strip()
+        if not text or _SCRATCHPAD.search(text):
+            continue
+        cleaned.append(text)
+    return cleaned
 
 
 def _dedupe(items: list[str]) -> list[str]:

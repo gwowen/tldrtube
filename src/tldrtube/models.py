@@ -6,7 +6,7 @@ model what each value means, so they are instructions as well as documentation.
 
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DEFAULT_MODEL = "lfm3:latest"
 DEFAULT_BASE_URL = "http://127.0.0.1:11434"
@@ -71,6 +71,21 @@ class Claim(BaseModel):
             "One id per line. A span is not an id."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _trim_evidence_ids(cls, data: object) -> object:
+        """Keep the first ids when a response cites more lines than the schema allows.
+
+        A long id list would otherwise fail validation and spend the only retry.
+        """
+
+        if not isinstance(data, dict):
+            return data
+        raw = data.get("evidence_ids")
+        if isinstance(raw, list) and len(raw) > MAX_EVIDENCE_IDS:
+            return {**data, "evidence_ids": raw[:MAX_EVIDENCE_IDS]}
+        return data
 
 
 class SummaryResponse(BaseModel):

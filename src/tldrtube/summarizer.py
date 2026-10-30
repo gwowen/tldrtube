@@ -36,12 +36,14 @@ from tldrtube.verifier import (
     VerificationError,
     cite_supporting_lines,
     claim_problems,
+    is_coverage_hint,
     normalize_claim,
     normalize_summary,
     order_key_points,
     pin_continuations,
     review_summary,
     salvage,
+    word_count,
 )
 
 logger = logging.getLogger("tldrtube")
@@ -385,10 +387,11 @@ def _extract_chunk(
 ) -> list[Claim] | None:
     """Extract one chunk. Retry once, then keep the supported points.
 
-    Returns None when both attempts are unreadable. A point that cites only the
+    Returns None when both attempts are unreadable. An empty list on the first
+    attempt is retried when the span contains speech. A later empty or thinner
+    list does not replace points already salvaged. A point that cites only the
     lookback is dropped. Repair may add a line from this span or its lookback,
-    including the next caption when a wrapped name needs it. The attempt with
-    more supported points is kept.
+    including the next caption when a wrapped name needs it.
     """
 
     segments = {segment.id: segment for segment in transcript.segments}
@@ -446,9 +449,16 @@ def _extract_chunk(
                     f"Candidate point {point_index} cites only the already covered context. "
                     "Cite at least one segment id from this span, or omit the point."
                 )
+        if not points and attempt == 0 and _span_has_speech(chunk):
+            problems = [_empty_extract_problem()]
+            kept_attempts.append([])
+            continue
         if not problems:
-            logger.info("Supported points from %s: %s.", label, len(points))
-            return points
+            best_kept = max((len(item) for item in kept_attempts), default=0)
+            if len(points) >= best_kept:
+                logger.info("Supported points from %s: %s.", label, len(points))
+                return points
+            break
         kept_attempts.append(
             _supported_points(points, segments, context_ids, allowed_ids)
         )
@@ -505,10 +515,16 @@ def _generate(
     temperature: float,
     activity: str,
 ) -> SummaryResponse:
-    """Ask once, then at most once more. Salvage the last readable response."""
+    """Ask once, then at most once more. Keep the richer supported draft.
+
+    A word or point shortfall does not trigger the retry. When a retry does
+    happen, each readable draft is salvaged and the one with more supported
+    key points, then more words, is kept.
+    """
 
     problems: list[str] = []
     parsed: SummaryResponse | None = None
+    readable: list[SummaryResponse] = []
     for attempt in range(2):
         if attempt:
             logger.info("The response was not accepted. Asking the model to correct it.")
@@ -533,18 +549,48 @@ def _generate(
             logger.info("The model response could not be parsed: %s", _short_parse_reason(exc))
             problems = [_schema_problem()]
             continue
+        readable.append(parsed)
         problems = review_summary(parsed, transcript, preset)
-        if not problems:
+        if not any(not is_coverage_hint(problem) for problem in problems):
             logger.info("The summary passed the evidence checks.")
-            return order_key_points(parsed, transcript)
-    if parsed is None:
+            if len(readable) == 1:
+                return order_key_points(parsed, transcript)
+            logger.info("Removing claims that are not supported by the transcript.")
+            return _prefer_salvage(readable, transcript, preset)
+    if not readable:
         _log_problems(problems)
         raise ModelError(
             "The model returned a response that could not be read as the expected summary."
         )
     _log_problems(problems)
     logger.info("Removing claims that are not supported by the transcript.")
-    return salvage(parsed, transcript, preset)
+    return _prefer_salvage(readable, transcript, preset)
+
+
+def _prefer_salvage(
+    candidates: Sequence[SummaryResponse],
+    transcript: Transcript,
+    preset: LengthPreset,
+) -> SummaryResponse:
+    """Keep the salvaged draft with more key points, then more words."""
+
+    salvaged: list[SummaryResponse] = []
+    error: VerificationError | None = None
+    for candidate in candidates:
+        try:
+            salvaged.append(salvage(candidate, transcript, preset))
+        except VerificationError as exc:
+            error = exc
+    if not salvaged:
+        raise error if error is not None else VerificationError(
+            "A faithful summary could not be produced."
+        )
+    best = salvaged[0]
+    for item in salvaged[1:]:
+        rank = (len(item.key_points), word_count(item))
+        if rank > (len(best.key_points), word_count(best)):
+            best = item
+    return best
 
 
 def _num_ctx(prompt_chars: int, num_predict: int) -> int:
@@ -615,7 +661,7 @@ def _short_parse_reason(exc: BaseException) -> str:
         return "the output did not match the summary schema."
     reason = "; ".join(lines[:4])
     if len(reason) > 200:
-        return "the output did not match the summary schema."
+        return reason[:197].rstrip() + "..."
     return reason
 
 
@@ -679,6 +725,7 @@ def _extract_prompt(chunk: Chunk, allowed: Sequence[str], problems: list[str]) -
     text = (
         f"Span {chunk.id}. List the candidate points that are new in this span. "
         "State each point as one complete idea, in spoken order. "
+        "Write each point as an ordinary sentence. Do not capitalise every word. "
         "Prefer a few complete ideas over a list of fragments. "
         "Skip asides that do not change the argument.\n\n"
         f"{_evidence_rule(allowed)}\n\n"
@@ -686,6 +733,18 @@ def _extract_prompt(chunk: Chunk, allowed: Sequence[str], problems: list[str]) -
         f"Transcript:\n{lines}"
     )
     return text + _correction(problems)
+
+
+def _span_has_speech(chunk: Chunk) -> bool:
+    return any(not segment.non_speech and segment.text.strip() for segment in chunk.segments)
+
+
+def _empty_extract_problem() -> str:
+    return (
+        "This span contains speech but the point list was empty. "
+        "Return the distinct claims, stories, or arguments in this span. "
+        "Use an empty list only when the span adds nothing beyond the already covered context."
+    )
 
 
 def _context_only(point: Claim, context_ids: set[str]) -> bool:
