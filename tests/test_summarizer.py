@@ -1,5 +1,6 @@
 """Summariser passes, retries, and fail-closed behaviour."""
 
+import logging
 import re
 
 import httpx
@@ -9,7 +10,16 @@ from ollama import ResponseError
 
 from tldrtube.cli import configure_logging
 from tldrtube.models import MAX_EVIDENCE_IDS, PRESETS, Claim, ExtractResponse, SummaryResponse
-from tldrtube.summarizer import ModelError, require_installed_model, resolve_base_url, summarize
+from tldrtube.summarizer import (
+    _MAX_CONTEXT,
+    _num_ctx,
+    _short_parse_reason,
+    logger,
+    ModelError,
+    require_installed_model,
+    resolve_base_url,
+    summarize,
+)
 from tldrtube.transcript import build_transcript
 from tldrtube.verifier import VerificationError
 
@@ -75,6 +85,7 @@ def test_configured_temperature_is_sent_to_ollama(monkeypatch) -> None:
             return self
 
         def invoke(self, messages):
+            captured["messages"] = messages
             return acceptable()
 
     monkeypatch.setattr("tldrtube.summarizer.ChatOllama", FakeOllama)
@@ -91,6 +102,99 @@ def test_configured_temperature_is_sent_to_ollama(monkeypatch) -> None:
     assert captured["temperature"] == 0.2
     assert captured["reasoning"] is False
     assert isinstance(captured["num_predict"], int)
+    prompt_chars = sum(len(message.content) for message in captured["messages"])
+    assert captured["num_ctx"] >= prompt_chars // 3 + captured["num_predict"]
+    assert captured["num_ctx"] <= _MAX_CONTEXT
+
+
+def test_context_window_covers_a_one_pass_prompt() -> None:
+    predict = PRESETS["medium"].num_predict
+    ctx = _num_ctx(15_000, predict)
+    assert ctx > 4096
+    assert ctx >= 15_000 // 3 + predict
+    assert _num_ctx(1_000_000, 1100) == _MAX_CONTEXT
+
+
+def test_retry_sizes_context_to_the_longer_prompt(monkeypatch) -> None:
+    contexts: list[int] = []
+
+    class FakeOllama:
+        def __init__(self, **kwargs) -> None:
+            contexts.append(kwargs["num_ctx"])
+
+        def with_structured_output(self, schema, method="json_schema"):
+            assert method == "json_schema"
+            return self
+
+        def invoke(self, messages):
+            if len(contexts) == 1:
+                raise OutputParserException("Invalid json output: {")
+            return acceptable()
+
+    monkeypatch.setattr("tldrtube.summarizer.ChatOllama", FakeOllama)
+    summarize(
+        transcript_with("The lecture shows how a hash table stores keys."),
+        preset=PRESETS["short"],
+    )
+    assert len(contexts) == 2
+    assert contexts[1] > contexts[0]
+
+
+def test_short_parse_reason_drops_the_completion() -> None:
+    dump = "s1, " * 40
+    cut_off = _short_parse_reason(OutputParserException(f"Invalid json output: {dump}"))
+    assert "cut off" in cut_off
+    assert dump not in cut_off
+    reason = _short_parse_reason(
+        OutputParserException(
+            "Failed to parse SummaryResponse from completion "
+            + dump
+            + ". Got: 1 validation error for SummaryResponse\n"
+            "evidence_ids\n"
+            "  List should have at most 8 items after validation, not 40 "
+            "[type=too_long, input_value=['s1'], input_type=list]"
+        )
+    )
+    assert dump not in reason
+    assert "evidence_ids" in reason
+    assert "at most 8" in reason
+    assert "input_value" not in reason
+
+
+def test_parse_failure_logs_a_short_reason() -> None:
+    dump = "s1, " * 40
+    records: list[str] = []
+
+    class Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = Handler()
+    handler.setLevel(logging.INFO)
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    chat = FakeChat(
+        [
+            OutputParserException(f"Invalid json output: {dump}"),
+            acceptable(),
+        ]
+    )
+    try:
+        summarize(
+            transcript_with("The lecture shows how a hash table stores keys."),
+            preset=PRESETS["short"],
+            chat_model=chat,
+        )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    logged = "\n".join(records)
+    assert dump not in logged
+    assert "cut off" in logged
+    correction = user_text(chat.calls[1])
+    assert dump not in correction
+    assert "required schema" in correction
 
 
 def test_short_transcript_uses_one_summary_call() -> None:
